@@ -1,0 +1,7 @@
+{
+  "mode": "decode_live",
+  "tty_device": "/dev/ttyUSB0",
+  "baud_rate": 115200,
+  "read_timeout_s": 0.25,
+  "write_timeout_s": 1.0
+}

@@ -1,0 +1,22 @@
+services:
+  backend:
+    image: decodex_backend:latest
+    container_name: decodex-backend
+    ports:
+      - "8000:8000"
+    networks:
+      - decodex-net
+    restart: unless-stopped
+
+  frontend:
+    image: decodex_frontend:latest
+    container_name: decodex-frontend
+    ports:
+      - "7000:3007"
+    networks:
+      - decodex-net
+    restart: unless-stopped
+
+networks:
+  decodex-net:
+    driver: bridge

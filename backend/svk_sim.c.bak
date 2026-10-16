@@ -1,0 +1,1927 @@
+/*
+ * ============================================================================
+ * svk_sim.c  —  SVK SIM Station XML + StoryBoard XML Parser + CSV Encoder
+ *               + UDP Network Transmission Engine
+ *
+ * DOCUMENT REFERENCE : RDSO/SPN/196/2020  Annexure-C  (Amendment-10)
+ * SAFETY INTEGRITY   : Intended for SIL-4 Railway Signalling Systems
+ *                      (Train Collision Avoidance System – TCAS)
+ *
+ * BUILD (shared library, loaded by Python via ctypes):
+ *   gcc -shared -fPIC -O2 -Wall -Wextra -o svk_sim.so svk_sim.c
+ *
+ * BUILD (test executable – define SVK_TEST_MAIN):
+ *   gcc -DSVK_TEST_MAIN -O2 -Wall -Wextra -o svk_sim_test svk_sim.c
+ *
+ * ----------------------------------------------------------------------------
+ * EXPORTED FUNCTIONS
+ * ----------------------------------------------------------------------------
+ *
+ *  1. parse_station_xml()
+ *       Parses a Station Configuration XML file into a JSON structure
+ *       containing station identity, location, signals and point machines.
+ *
+ *  2. parse_storyboard_xml()
+ *       Parses a StoryBoard XML (OpenSCENARIO-style) into a JSON structure
+ *       of Stories → Acts → Events with speed-action and trigger conditions.
+ *
+ *  3. encode_storyboard_csv()
+ *       Reads the TCAS Storyboard CSV (35-column Annexure-C format), encodes
+ *       each data row into the correct binary packet (PKT_TYPE 9–13) and
+ *       returns a JSON array with the row's hex bytes, byte-length, and
+ *       packet-type metadata.
+ *
+ *  4. transmit_storyboard_csv()   ← NEW
+ *       Reads the same CSV, encodes every data row in TDMA frame order, then
+ *       transmits each packet over UDP to a remote SVK Stresser endpoint.
+ *       Packets within the same TDMA frame window (2-second epoch, matching
+ *       the StoryBoard frame rate) are dispatched together; then the function
+ *       sleeps until the next 2-second boundary before processing the next
+ *       frame number group.
+ *
+ *       Signature:
+ *         int transmit_storyboard_csv(
+ *             const char *csv_text,   // full CSV content (NUL-terminated)
+ *             const char *dest_ip,    // destination IPv4 address string
+ *             int         dest_port,  // destination UDP port (1–65535)
+ *             int         loop,       // 0 = play once; 1 = loop forever
+ *             volatile int *stop_flag // pointer to int; set to 1 to abort
+ *         );
+ *       Returns:
+ *         0  – completed successfully (or stopped via stop_flag)
+ *        -1  – invalid argument
+ *        -2  – socket creation / bind failure
+ *        -3  – encoding error
+ *
+ * ============================================================================
+ * DESIGN NOTES FOR SIL-4 MAINTENANCE ENGINEERS
+ * ============================================================================
+ *
+ *  Determinism & Safety
+ *  --------------------
+ *  • No dynamic memory allocation occurs during the transmission loop.
+ *    All working buffers are allocated on the stack or as static storage.
+ *  • The BitWriter structure is initialised to zero before every encode
+ *    call (bw_init), ensuring no stale data contaminates a new packet.
+ *  • All field widths are explicitly stated in comments alongside every
+ *    bw_write() call so they can be verified against Annexure-C by
+ *    inspection.
+ *  • Integer overflow cannot occur in field encoding: all fields are
+ *    masked to their declared width inside bw_write() / bw_write_signed().
+ *
+ *  Packet Structure Map (each encoder is self-documenting)
+ *  -------------------------------------------------------
+ *  PKT_TYPE 9  – Station/ILC/IBS → Onboard Regular Packet   (§C.4.2)
+ *  PKT_TYPE 10 – Onboard → Station Regular Packet            (§C.4.3)
+ *  PKT_TYPE 11 – Access Authority Packet v2.0                (§C.4.4)
+ *  PKT_TYPE 12 – Additional Emergency Packet                 (§C.4.5)
+ *  PKT_TYPE 13 – Onboard Access Request Packet               (§C.4.6)
+ *
+ *  CSV Column Layout (0-indexed, 35 columns total)
+ *  ------------------------------------------------
+ *  Col  0  TDMASlot        Col 18  nxtSigAsp
+ *  Col  1  pktType         Col 19  apprSigDist
+ *  Col  2  pktLen          Col 20  authType
+ *  Col  3  frameNum        Col 21  authSpeed
+ *  Col  4  srcStationId    Col 22  MA
+ *  Col  5  srcStationVer   Col 23  shortMA
+ *  Col  6  locoId          Col 24  revMA
+ *  Col  7  refProfileNum   Col 25  TLsts
+ *  Col  8  lastRefRfid     Col 26  TLtype
+ *  Col  9  distPktStart    Col 27  refFN
+ *  Col 10  pktDir          Col 28  refOff
+ *  Col 11  subPktType      Col 29  nxtStnHO
+ *  Col 12  subPktLen       Col 30  nxtStationId
+ *  Col 13  frameOffset     Col 31  profileID
+ *  Col 14  sos             Col 32  TLIProfID
+ *  Col 15  secType         Col 33  CBCMAC
+ *  Col 16  curSigInfo      Col 34  CRC
+ *  Col 17  curSigAsp
+ *
+ * ============================================================================
+ */
+
+/* ── Standard headers ─────────────────────────────────────────────────────── */
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <stdint.h>
+#include <stdarg.h>
+#include <ctype.h>
+#include <time.h>
+
+/* POSIX socket headers (Linux / POSIX) */
+#include <unistd.h>
+#include <errno.h>
+#include <sys/types.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <linux/time.h>
+
+/* ============================================================================
+ * SECTION 1 – TINY XML HELPERS
+ *
+ * These are minimal, allocation-free XML helpers sufficient for the structured
+ * (non-namespace) XML formats produced by the SVK SIM configuration tools.
+ * They are NOT a general-purpose XML parser.
+ * ============================================================================ */
+
+/**
+ * find_tag() – locate the text content of the first occurrence of <tag>…</tag>
+ *
+ * @src      : XML source string (NUL-terminated, read-only)
+ * @tag      : tag name (without angle brackets)
+ * @tag_end  : if non-NULL, receives a pointer to the character immediately
+ *             after the closing </tag> (useful for iterating sibling tags)
+ *
+ * Returns   : pointer to first character of the tag's TEXT content, or NULL
+ *             if the tag is not found.
+ *
+ * NOTE      : The function handles self-closing tags defensively but does not
+ *             return content for them (content would be zero-length).
+ */
+static const char *find_tag(const char *src,
+                              const char *tag,
+                              const char **tag_end)
+{
+    char open[128], close[128];
+    snprintf(open,  sizeof(open),  "<%s",   tag);
+    snprintf(close, sizeof(close), "</%s>", tag);
+
+    const char *p = strstr(src, open);
+    if (!p) return NULL;
+
+    const char *gt = strchr(p, '>');
+    if (!gt) return NULL;
+
+    const char *content_start = gt + 1;
+    const char *cl = strstr(content_start, close);
+
+    if (tag_end)
+        *tag_end = cl ? (cl + strlen(close)) : content_start;
+
+    return content_start;
+}
+
+/**
+ * get_tag_text() – copy the trimmed text content of a tag into dst[].
+ *
+ * Writes an empty string to dst if the tag is missing or content is absent.
+ */
+static void get_tag_text(const char *src,
+                          const char *tag,
+                          char       *dst,
+                          int         dst_len)
+{
+    const char *end_sentinel;
+    const char *start = find_tag(src, tag, &end_sentinel);
+    if (!start) { dst[0] = '\0'; return; }
+
+    char close[128];
+    snprintf(close, sizeof(close), "</%s>", tag);
+    const char *end = strstr(start, close);
+    if (!end) { dst[0] = '\0'; return; }
+
+    /* Trim leading whitespace */
+    while (start < end && isspace((unsigned char)*start)) start++;
+    /* Trim trailing whitespace */
+    while (end > start && isspace((unsigned char)*(end - 1))) end--;
+
+    int len = (int)(end - start);
+    if (len >= dst_len) len = dst_len - 1;
+    memcpy(dst, start, len);
+    dst[len] = '\0';
+}
+
+/**
+ * get_attr() – extract the value of a named XML attribute.
+ *
+ * Searches for   attr="value"   within the supplied tag_open string
+ * (which should span from '<' up to and including '>').
+ */
+static void get_attr(const char *tag_open,
+                      const char *attr,
+                      char       *dst,
+                      int         dst_len)
+{
+    char search[128];
+    snprintf(search, sizeof(search), "%s=\"", attr);
+
+    const char *p = strstr(tag_open, search);
+    if (!p) { dst[0] = '\0'; return; }
+
+    p += strlen(search);
+    const char *q = strchr(p, '"');
+    if (!q) { dst[0] = '\0'; return; }
+
+    int len = (int)(q - p);
+    if (len >= dst_len) len = dst_len - 1;
+    memcpy(dst, p, len);
+    dst[len] = '\0';
+}
+
+/**
+ * json_escape() – copy src into dst, escaping '"' and '\\' for JSON strings.
+ */
+static void json_escape(const char *src, char *dst, int dst_len)
+{
+    int di = 0;
+    for (int si = 0; src[si] && di < dst_len - 2; si++) {
+        char c = src[si];
+        if ((c == '"' || c == '\\') && di < dst_len - 3)
+            dst[di++] = '\\';
+        dst[di++] = c;
+    }
+    dst[di] = '\0';
+}
+
+/**
+ * buf_append() – vsnprintf into a bounded output buffer with position tracking.
+ *
+ * Returns 0 on success, -1 if the buffer would overflow.
+ */
+static int buf_append(char *buf, int *pos, int buf_len, const char *fmt, ...)
+{
+    va_list args;
+    va_start(args, fmt);
+    int written = vsnprintf(buf + *pos, buf_len - *pos, fmt, args);
+    va_end(args);
+
+    if (written < 0 || *pos + written >= buf_len)
+        return -1;
+
+    *pos += written;
+    return 0;
+}
+
+/* ============================================================================
+ * SECTION 2 – STATION XML PARSER
+ *
+ * Converts a Station Configuration XML document into a compact JSON object
+ * of the form:
+ *
+ *   {
+ *     "type": "station_config",
+ *     "station_count": N,
+ *     "stations": [
+ *       {
+ *         "id":        "...",
+ *         "name":      "...",
+ *         "type":      "...",
+ *         "km_post":   "...",
+ *         "section":   "...",
+ *         "lat":       "...",
+ *         "lon":       "...",
+ *         "signals":   [ { "id":"...", "type":"...", "aspect":"..." }, ... ],
+ *         "points":    [ { "id":"...", "normal":"...", "status":"..." }, ... ]
+ *       },
+ *       ...
+ *     ]
+ *   }
+ * ============================================================================ */
+
+int parse_station_xml(const char *xml, char *out_json, int out_len)
+{
+    if (!xml || !out_json || out_len < 64) return -1;
+
+    int pos = 0;
+    if (buf_append(out_json, &pos, out_len,
+                   "{\"type\":\"station_config\",\"stations\":[") < 0)
+        return -1;
+
+    const char *cursor = xml;
+    int station_count  = 0;
+
+    while (1) {
+        /* Locate next <Station ...> opening tag */
+        const char *stag = strstr(cursor, "<Station");
+        if (!stag) break;
+
+        const char *stag_end = strchr(stag, '>');
+        if (!stag_end) break;
+
+        const char *etag = strstr(stag_end, "</Station>");
+        if (!etag) break;
+
+        /* --- Extract station element content --- */
+        int content_len = (int)(etag - stag_end - 1);
+        if (content_len < 0) content_len = 0;
+        char *content = (char *)malloc(content_len + 1);
+        if (!content) return -1;
+        memcpy(content, stag_end + 1, content_len);
+        content[content_len] = '\0';
+
+        /* --- Extract opening tag (for attribute parsing) --- */
+        int tag_attr_len = (int)(stag_end - stag) + 1;
+        char *tag_attr   = (char *)malloc(tag_attr_len + 1);
+        if (!tag_attr) { free(content); return -1; }
+        memcpy(tag_attr, stag, tag_attr_len);
+        tag_attr[tag_attr_len] = '\0';
+
+        /* Station identity attributes */
+        char id[64], name[128], type[32];
+        get_attr(tag_attr, "id",   id,   sizeof(id));
+        get_attr(tag_attr, "name", name, sizeof(name));
+        get_attr(tag_attr, "type", type, sizeof(type));
+        free(tag_attr);
+
+        /* Station child elements */
+        char km[32], section[64];
+        get_tag_text(content, "KmPost",  km,      sizeof(km));
+        get_tag_text(content, "Section", section, sizeof(section));
+
+        /* Optional <Location lat="..." lon="..."/> attribute */
+        char lat[32] = "", lon[32] = "";
+        const char *loc = strstr(content, "<Location");
+        if (loc) {
+            const char *loc_end = strchr(loc, '>');
+            if (loc_end) {
+                int llen = (int)(loc_end - loc) + 1;
+                char *ltag = (char *)malloc(llen + 1);
+                if (ltag) {
+                    memcpy(ltag, loc, llen);
+                    ltag[llen] = '\0';
+                    get_attr(ltag, "lat", lat, sizeof(lat));
+                    get_attr(ltag, "lon", lon, sizeof(lon));
+                    free(ltag);
+                }
+            }
+        }
+
+        /* --- Build signals JSON array --- */
+        char signals_json[4096] = "[]";
+        {
+            const char *sig_block_end;
+            const char *sig_block_start = find_tag(content, "Signals",
+                                                    &sig_block_end);
+            if (sig_block_start) {
+                char sig_buf[4096];
+                int  spos      = 0;
+                int  first_sig = 1;
+                sig_buf[spos++] = '[';
+
+                const char *sc = sig_block_start;
+                while (1) {
+                    const char *stg = strstr(sc, "<Signal");
+                    if (!stg || stg >= sig_block_end - (int)strlen("<Signal"))
+                        break;
+
+                    const char *stg_end = strchr(stg, '>');
+                    if (!stg_end) break;
+
+                    int slen = (int)(stg_end - stg) + 1;
+                    char *sbuf = (char *)malloc(slen + 1);
+                    if (!sbuf) break;
+                    memcpy(sbuf, stg, slen);
+                    sbuf[slen] = '\0';
+
+                    char sid[32], stype[32], saspect[32];
+                    get_attr(sbuf, "id",     sid,     sizeof(sid));
+                    get_attr(sbuf, "type",   stype,   sizeof(stype));
+                    get_attr(sbuf, "aspect", saspect, sizeof(saspect));
+                    free(sbuf);
+
+                    char eid[64], etype[64], easpect[64];
+                    json_escape(sid,     eid,     sizeof(eid));
+                    json_escape(stype,   etype,   sizeof(etype));
+                    json_escape(saspect, easpect, sizeof(easpect));
+
+                    if (!first_sig && spos < (int)sizeof(sig_buf) - 2)
+                        sig_buf[spos++] = ',';
+                    first_sig = 0;
+
+                    spos += snprintf(sig_buf + spos,
+                                     sizeof(sig_buf) - spos,
+                                     "{\"id\":\"%s\",\"type\":\"%s\","
+                                     "\"aspect\":\"%s\"}",
+                                     eid, etype, easpect);
+                    sc = stg_end + 1;
+                }
+
+                if (spos < (int)sizeof(sig_buf) - 2)
+                    sig_buf[spos++] = ']';
+                sig_buf[spos] = '\0';
+                snprintf(signals_json, sizeof(signals_json), "%s", sig_buf);
+            }
+        }
+
+        /* --- Build points JSON array --- */
+        char points_json[4096] = "[]";
+        {
+            const char *pt_block_end;
+            const char *pt_block_start = find_tag(content, "Points",
+                                                   &pt_block_end);
+            if (pt_block_start) {
+                char pt_buf[4096];
+                int  ppos    = 0;
+                int  first_pt = 1;
+                pt_buf[ppos++] = '[';
+
+                const char *pc = pt_block_start;
+                while (1) {
+                    const char *ptg = strstr(pc, "<Point");
+                    if (!ptg || ptg >= pt_block_end - (int)strlen("<Point"))
+                        break;
+
+                    const char *ptg_end = strchr(ptg, '>');
+                    if (!ptg_end) break;
+
+                    int plen = (int)(ptg_end - ptg) + 1;
+                    char *pbuf = (char *)malloc(plen + 1);
+                    if (!pbuf) break;
+                    memcpy(pbuf, ptg, plen);
+                    pbuf[plen] = '\0';
+
+                    char pid[32], pnormal[32], pstatus[32];
+                    get_attr(pbuf, "id",     pid,     sizeof(pid));
+                    get_attr(pbuf, "normal", pnormal, sizeof(pnormal));
+                    get_attr(pbuf, "status", pstatus, sizeof(pstatus));
+                    free(pbuf);
+
+                    char eid[64], enormal[64], estatus[64];
+                    json_escape(pid,     eid,     sizeof(eid));
+                    json_escape(pnormal, enormal, sizeof(enormal));
+                    json_escape(pstatus, estatus, sizeof(estatus));
+
+                    if (!first_pt && ppos < (int)sizeof(pt_buf) - 2)
+                        pt_buf[ppos++] = ',';
+                    first_pt = 0;
+
+                    ppos += snprintf(pt_buf + ppos,
+                                     sizeof(pt_buf) - ppos,
+                                     "{\"id\":\"%s\",\"normal\":\"%s\","
+                                     "\"status\":\"%s\"}",
+                                     eid, enormal, estatus);
+                    pc = ptg_end + 1;
+                }
+
+                if (ppos < (int)sizeof(pt_buf) - 2)
+                    pt_buf[ppos++] = ']';
+                pt_buf[ppos] = '\0';
+                snprintf(points_json, sizeof(points_json), "%s", pt_buf);
+            }
+        }
+
+        free(content);
+
+        /* JSON-escape all string values before embedding */
+        char eid[128], ename[256], etype[64], ekm[64], esec[128];
+        json_escape(id,      eid,   sizeof(eid));
+        json_escape(name,    ename, sizeof(ename));
+        json_escape(type,    etype, sizeof(etype));
+        json_escape(km,      ekm,   sizeof(ekm));
+        json_escape(section, esec,  sizeof(esec));
+
+        if (station_count > 0)
+            if (buf_append(out_json, &pos, out_len, ",") < 0) return -1;
+
+        if (buf_append(out_json, &pos, out_len,
+                       "{\"id\":\"%s\",\"name\":\"%s\",\"type\":\"%s\","
+                       "\"km_post\":\"%s\",\"section\":\"%s\","
+                       "\"lat\":\"%s\",\"lon\":\"%s\","
+                       "\"signals\":%s,\"points\":%s}",
+                       eid, ename, etype, ekm, esec,
+                       lat[0] ? lat : "0",
+                       lon[0] ? lon : "0",
+                       signals_json, points_json) < 0)
+            return -1;
+
+        station_count++;
+        cursor = etag + strlen("</Station>");
+    }
+
+    if (buf_append(out_json, &pos, out_len,
+                   "],\"station_count\":%d}", station_count) < 0)
+        return -1;
+
+    return 0;
+}
+
+/* ============================================================================
+ * SECTION 3 – STORYBOARD XML PARSER
+ *
+ * Parses an OpenSCENARIO-style StoryBoard XML document and returns JSON:
+ *
+ *   {
+ *     "type":    "storyboard",
+ *     "name":    "...",
+ *     "version": "...",
+ *     "meta": { "author":"...", "date":"...", "description":"..." },
+ *     "story_count": N,
+ *     "stories": [
+ *       {
+ *         "name": "...",
+ *         "act_count": N,
+ *         "acts": [
+ *           {
+ *             "name": "...",
+ *             "event_count": N,
+ *             "events": [
+ *               {
+ *                 "name":     "...",
+ *                 "priority": "...",
+ *                 "speed_action": {
+ *                   "value": "...", "unit": "...", "shape": "..."
+ *                 },
+ *                 "trigger_condition": {
+ *                   "name": "...", "value": "...", "rule": "..."
+ *                 }
+ *               },
+ *               ...
+ *             ]
+ *           },
+ *           ...
+ *         ]
+ *       },
+ *       ...
+ *     ]
+ *   }
+ * ============================================================================ */
+
+int parse_storyboard_xml(const char *xml, char *out_json, int out_len)
+{
+    if (!xml || !out_json || out_len < 64) return -1;
+
+    int pos = 0;
+
+    /* Extract StoryBoard-level attributes */
+    char board_name[128] = "", board_version[32] = "";
+    const char *sb_tag = strstr(xml, "<StoryBoard");
+    if (sb_tag) {
+        const char *sb_end = strchr(sb_tag, '>');
+        if (sb_end) {
+            int tlen  = (int)(sb_end - sb_tag) + 1;
+            char *tbuf = (char *)malloc(tlen + 1);
+            if (tbuf) {
+                memcpy(tbuf, sb_tag, tlen);
+                tbuf[tlen] = '\0';
+                get_attr(tbuf, "name",    board_name,    sizeof(board_name));
+                get_attr(tbuf, "version", board_version, sizeof(board_version));
+                free(tbuf);
+            }
+        }
+    }
+
+    /* Extract <Meta> child elements */
+    char meta_author[128] = "", meta_date[32] = "", meta_desc[256] = "";
+    {
+        const char *meta_end;
+        const char *meta = find_tag(xml, "Meta", &meta_end);
+        if (meta) {
+            int mlen = meta_end
+                       ? (int)(meta_end - strlen("</Meta>") - meta)
+                       : 0;
+            char meta_content[1024];
+            if (mlen > 0 && mlen < (int)sizeof(meta_content)) {
+                memcpy(meta_content, meta, mlen);
+                meta_content[mlen] = '\0';
+                get_tag_text(meta_content, "Author",      meta_author,
+                             sizeof(meta_author));
+                get_tag_text(meta_content, "Date",        meta_date,
+                             sizeof(meta_date));
+                get_tag_text(meta_content, "Description", meta_desc,
+                             sizeof(meta_desc));
+            }
+        }
+    }
+
+    /* Emit JSON header */
+    char en[256], ev[64], ea[128], ed[512];
+    json_escape(board_name,    en, sizeof(en));
+    json_escape(board_version, ev, sizeof(ev));
+    json_escape(meta_author,   ea, sizeof(ea));
+    json_escape(meta_desc,     ed, sizeof(ed));
+
+    if (buf_append(out_json, &pos, out_len,
+                   "{\"type\":\"storyboard\","
+                   "\"name\":\"%s\",\"version\":\"%s\","
+                   "\"meta\":{\"author\":\"%s\",\"date\":\"%s\","
+                   "\"description\":\"%s\"},"
+                   "\"stories\":[",
+                   en, ev, ea, meta_date, ed) < 0)
+        return -1;
+
+    const char *cursor = xml;
+    int story_count    = 0;
+
+    while (1) {
+        const char *stag = strstr(cursor, "<Story");
+        if (!stag) break;
+
+        const char *stag_gt = strchr(stag, '>');
+        if (!stag_gt) break;
+
+        const char *etag = strstr(stag_gt, "</Story>");
+        if (!etag) break;
+
+        /* Story name */
+        int sname_len = (int)(stag_gt - stag) + 1;
+        char *snbuf   = (char *)malloc(sname_len + 1);
+        if (!snbuf) break;
+        memcpy(snbuf, stag, sname_len);
+        snbuf[sname_len] = '\0';
+
+        char story_name[128];
+        get_attr(snbuf, "name", story_name, sizeof(story_name));
+        free(snbuf);
+
+        /* Story content */
+        int content_len = (int)(etag - stag_gt - 1);
+        if (content_len < 0) content_len = 0;
+        char *story_content = (char *)malloc(content_len + 1);
+        if (!story_content) break;
+        memcpy(story_content, stag_gt + 1, content_len);
+        story_content[content_len] = '\0';
+
+        /* Build acts array */
+        char acts_buf[16384];
+        int  apos      = 0;
+        int  act_count = 0;
+        acts_buf[apos++] = '[';
+
+        const char *acur = story_content;
+        while (1) {
+            const char *atag = strstr(acur, "<Act");
+            if (!atag) break;
+
+            const char *atag_gt = strchr(atag, '>');
+            if (!atag_gt) break;
+
+            const char *aetag = strstr(atag_gt, "</Act>");
+            if (!aetag) break;
+
+            /* Act name */
+            int alen    = (int)(atag_gt - atag) + 1;
+            char *anbuf = (char *)malloc(alen + 1);
+            if (!anbuf) break;
+            memcpy(anbuf, atag, alen);
+            anbuf[alen] = '\0';
+
+            char act_name[128];
+            get_attr(anbuf, "name", act_name, sizeof(act_name));
+            free(anbuf);
+
+            /* Act content */
+            int aclen = (int)(aetag - atag_gt - 1);
+            if (aclen < 0) aclen = 0;
+            char *act_content = (char *)malloc(aclen + 1);
+            if (!act_content) break;
+            memcpy(act_content, atag_gt + 1, aclen);
+            act_content[aclen] = '\0';
+
+            /* Build events array */
+            char events_buf[8192];
+            int  epos        = 0;
+            int  event_count = 0;
+            events_buf[epos++] = '[';
+
+            const char *ecur = act_content;
+            while (1) {
+                const char *evtag = strstr(ecur, "<Event");
+                if (!evtag) break;
+
+                const char *evtag_gt = strchr(evtag, '>');
+                if (!evtag_gt) break;
+
+                const char *evetag = strstr(evtag_gt, "</Event>");
+                if (!evetag) break;
+
+                /* Event attributes */
+                int evlen    = (int)(evtag_gt - evtag) + 1;
+                char *evbuf  = (char *)malloc(evlen + 1);
+                if (!evbuf) break;
+                memcpy(evbuf, evtag, evlen);
+                evbuf[evlen] = '\0';
+
+                char ev_name[128], ev_prio[64];
+                get_attr(evbuf, "name",     ev_name, sizeof(ev_name));
+                get_attr(evbuf, "priority", ev_prio, sizeof(ev_prio));
+                free(evbuf);
+
+                /* SpeedActionDynamics attributes */
+                char speed_val[32]   = "";
+                char speed_unit[32]  = "";
+                char speed_shape[32] = "";
+                const char *spd = strstr(evtag_gt, "<SpeedActionDynamics");
+                if (spd && spd < evetag) {
+                    const char *spd_end = strchr(spd, '>');
+                    if (spd_end) {
+                        int slen    = (int)(spd_end - spd) + 1;
+                        char *spdbuf = (char *)malloc(slen + 1);
+                        if (spdbuf) {
+                            memcpy(spdbuf, spd, slen);
+                            spdbuf[slen] = '\0';
+                            get_attr(spdbuf, "value",
+                                     speed_val,   sizeof(speed_val));
+                            get_attr(spdbuf, "dynamicsUnit",
+                                     speed_unit,  sizeof(speed_unit));
+                            get_attr(spdbuf, "dynamicsShape",
+                                     speed_shape, sizeof(speed_shape));
+                            free(spdbuf);
+                        }
+                    }
+                }
+
+                /* Trigger condition */
+                char cond_name[128] = "", cond_val[64] = "", cond_rule[64] = "";
+                const char *cond = strstr(evtag_gt, "<Condition");
+                if (cond && cond < evetag) {
+                    const char *cond_end = strchr(cond, '>');
+                    if (cond_end) {
+                        int clen      = (int)(cond_end - cond) + 1;
+                        char *condbuf = (char *)malloc(clen + 1);
+                        if (condbuf) {
+                            memcpy(condbuf, cond, clen);
+                            condbuf[clen] = '\0';
+                            get_attr(condbuf, "name", cond_name,
+                                     sizeof(cond_name));
+                            free(condbuf);
+                        }
+                    }
+                }
+                const char *stc = strstr(evtag_gt, "<SimulationTimeCondition");
+                if (stc && stc < evetag) {
+                    const char *stc_end = strchr(stc, '>');
+                    if (stc_end) {
+                        int slen     = (int)(stc_end - stc) + 1;
+                        char *stcbuf = (char *)malloc(slen + 1);
+                        if (stcbuf) {
+                            memcpy(stcbuf, stc, slen);
+                            stcbuf[slen] = '\0';
+                            get_attr(stcbuf, "value", cond_val,
+                                     sizeof(cond_val));
+                            get_attr(stcbuf, "rule",  cond_rule,
+                                     sizeof(cond_rule));
+                            free(stcbuf);
+                        }
+                    }
+                }
+
+                /* JSON-escape all string values */
+                char een[256], eep[128], esv[64], esu[64], ess[64];
+                char ecn[256], ecv[64], ecr[64];
+                json_escape(ev_name,    een, sizeof(een));
+                json_escape(ev_prio,    eep, sizeof(eep));
+                json_escape(speed_val,  esv, sizeof(esv));
+                json_escape(speed_unit, esu, sizeof(esu));
+                json_escape(speed_shape,ess, sizeof(ess));
+                json_escape(cond_name,  ecn, sizeof(ecn));
+                json_escape(cond_val,   ecv, sizeof(ecv));
+                json_escape(cond_rule,  ecr, sizeof(ecr));
+
+                if (event_count > 0 && epos < (int)sizeof(events_buf) - 2)
+                    events_buf[epos++] = ',';
+
+                epos += snprintf(events_buf + epos,
+                                 sizeof(events_buf) - epos,
+                                 "{\"name\":\"%s\",\"priority\":\"%s\","
+                                 "\"speed_action\":{\"value\":\"%s\","
+                                 "\"unit\":\"%s\",\"shape\":\"%s\"},"
+                                 "\"trigger_condition\":{\"name\":\"%s\","
+                                 "\"value\":\"%s\",\"rule\":\"%s\"}}",
+                                 een, eep, esv, esu, ess,
+                                 ecn, ecv, ecr);
+
+                event_count++;
+                ecur = evetag + strlen("</Event>");
+            }
+
+            if (epos < (int)sizeof(events_buf) - 2)
+                events_buf[epos++] = ']';
+            events_buf[epos] = '\0';
+            free(act_content);
+
+            char ean[256];
+            json_escape(act_name, ean, sizeof(ean));
+
+            if (act_count > 0 && apos < (int)sizeof(acts_buf) - 2)
+                acts_buf[apos++] = ',';
+
+            apos += snprintf(acts_buf + apos, sizeof(acts_buf) - apos,
+                             "{\"name\":\"%s\",\"event_count\":%d,"
+                             "\"events\":%s}",
+                             ean, event_count, events_buf);
+            act_count++;
+            acur = aetag + strlen("</Act>");
+        }
+
+        if (apos < (int)sizeof(acts_buf) - 2)
+            acts_buf[apos++] = ']';
+        acts_buf[apos] = '\0';
+        free(story_content);
+
+        char esn[256];
+        json_escape(story_name, esn, sizeof(esn));
+
+        if (story_count > 0)
+            if (buf_append(out_json, &pos, out_len, ",") < 0) return -1;
+
+        if (buf_append(out_json, &pos, out_len,
+                       "{\"name\":\"%s\",\"act_count\":%d,\"acts\":%s}",
+                       esn, act_count, acts_buf) < 0)
+            return -1;
+
+        story_count++;
+        cursor = etag + strlen("</Story>");
+    }
+
+    if (buf_append(out_json, &pos, out_len,
+                   "],\"story_count\":%d}", story_count) < 0)
+        return -1;
+
+    return 0;
+}
+
+/* ============================================================================
+ * SECTION 4 – BIT-STREAM WRITER
+ *
+ * Provides MSB-first bit-level packing into a fixed-size byte buffer.
+ * This is the fundamental primitive used by all Annexure-C packet encoders.
+ *
+ * Maximum packet size supported: 1024 bytes = 8192 bits.
+ * The largest packet type (PKT_TYPE 9) is bounded by sub-packet size;
+ * in practice no TCAS packet exceeds ~64 bytes, so 1024 bytes is safe.
+ * ============================================================================ */
+
+/** BitWriter – maintains a byte buffer and a current bit position. */
+typedef struct {
+    uint8_t buf[1024]; /**< Packed byte output buffer                     */
+    int     bit_pos;   /**< Next bit to write (0 = MSB of first byte)     */
+} BitWriter;
+
+/**
+ * bw_init() – zero the buffer and reset bit position.
+ *
+ * MUST be called before using a BitWriter for a new packet.
+ */
+static void bw_init(BitWriter *bw)
+{
+    memset(bw->buf, 0, sizeof(bw->buf));
+    bw->bit_pos = 0;
+}
+
+/**
+ * bw_write() – write the low-order 'nbits' bits of 'value', MSB first.
+ *
+ * @bw    : target BitWriter
+ * @value : unsigned value to write (bits above nbits are ignored)
+ * @nbits : number of bits to write (1..64)
+ *
+ * Example: bw_write(bw, 0x3, 2) writes binary "11".
+ *
+ * SIL-4 note: The loop writes one bit per iteration to avoid any
+ * possibility of misaligned word writes, ensuring correct behaviour
+ * regardless of host endianness.
+ */
+static void bw_write(BitWriter *bw, uint64_t value, int nbits)
+{
+    for (int i = nbits - 1; i >= 0; i--) {
+        int byte_idx = bw->bit_pos / 8;
+        int bit_idx  = 7 - (bw->bit_pos % 8);  /* MSB-first within byte */
+
+        if ((value >> i) & 1ULL)
+            bw->buf[byte_idx] |= (uint8_t)(1u << bit_idx);
+
+        bw->bit_pos++;
+    }
+}
+
+/**
+ * bw_write_signed() – write a signed integer value as 2's-complement, MSB first.
+ *
+ * @bw    : target BitWriter
+ * @value : signed value (e.g. distPktStart which may be negative)
+ * @nbits : field width in bits (value is masked to this width)
+ */
+static void bw_write_signed(BitWriter *bw, int64_t value, int nbits)
+{
+    /*
+     * Cast to uint64 with masking: for nbits < 64, mask off upper bits so
+     * negative values are correctly represented as 2's complement within
+     * the declared field width.
+     */
+    uint64_t mask = (nbits < 64) ? (((uint64_t)1 << nbits) - 1ULL)
+                                 : (uint64_t)-1ULL;
+    bw_write(bw, (uint64_t)(value) & mask, nbits);
+}
+
+/**
+ * bw_byte_len() – return the number of bytes used (rounded up from bits).
+ */
+static int bw_byte_len(const BitWriter *bw)
+{
+    return (bw->bit_pos + 7) / 8;
+}
+
+/**
+ * bw_backfill_7bit() – write a 7-bit value at a previously-reserved position.
+ *
+ * Used to back-fill the SUB_PKT_LENGTH field in PKT_TYPE 9 after the
+ * sub-packet content is known.
+ *
+ * @bw      : target BitWriter
+ * @bit_pos : bit position (inclusive start) of the 7-bit field to overwrite
+ * @val7    : 7-bit value to write (high bits are ignored)
+ */
+static void bw_backfill_7bit(BitWriter *bw, int bit_pos, uint8_t val7)
+{
+    for (int i = 6; i >= 0; i--) {
+        int bpos   = bit_pos + (6 - i);
+        int byte_i = bpos / 8;
+        int bit_i  = 7 - (bpos % 8);
+
+        if ((val7 >> i) & 1u)
+            bw->buf[byte_i] |=  (uint8_t)(1u << bit_i);
+        else
+            bw->buf[byte_i] &= ~(uint8_t)(1u << bit_i);
+    }
+}
+
+/* ============================================================================
+ * SECTION 5 – CSV ROW PARSER
+ *
+ * The TCAS StoryBoard CSV has exactly 35 data columns (indices 0–34).
+ * Lines beginning with '#' (after optional leading whitespace) are comments
+ * and are always silently skipped.  This handles:
+ *
+ *   #,TimeLost Interval,,2,...          – scenario metadata comment
+ *   #TDMASlot,pktType,...               – column-header comment
+ *   #,,,,,,...                          – blank separator comment
+ *
+ * Any line with fewer than CSV_MIN_COLS parsed integers is discarded.
+ * ============================================================================ */
+
+#define CSV_MIN_COLS  35   /**< All 35 columns must be present for encoding  */
+#define MAX_COLS      40   /**< Guard against malformed over-wide rows        */
+
+/** CsvRow – parsed values and validity flag for one CSV data row. */
+typedef struct {
+    long long v[MAX_COLS]; /**< Parsed column values (signed 64-bit)          */
+    int       n;           /**< Number of columns successfully parsed          */
+    int       valid;       /**< 1 = usable data row;  0 = comment/blank/error  */
+} CsvRow;
+
+/**
+ * parse_csv_row() – parse one CSV line into a CsvRow.
+ *
+ * @line : NUL-terminated line string (no newline characters expected)
+ *
+ * Returns a CsvRow with .valid = 0 for comment/blank/malformed lines.
+ */
+static CsvRow parse_csv_row(const char *line)
+{
+    CsvRow row;
+    memset(&row, 0, sizeof(row));
+
+    /* Skip leading whitespace */
+    while (*line == ' ' || *line == '\t') line++;
+
+    /* Discard comment lines (any line whose first character is '#') */
+    if (*line == '#') return row;
+
+    /* Discard blank lines */
+    if (*line == '\0' || *line == '\r' || *line == '\n') return row;
+
+    row.valid = 1;
+
+    const char *p = line;
+    int col = 0;
+
+    while (*p && *p != '\r' && *p != '\n' && col < MAX_COLS) {
+        char *endp;
+        row.v[col] = strtoll(p, &endp, 10);
+        col++;
+
+        if (*endp == ',')
+            p = endp + 1;   /* advance past comma to next field */
+        else
+            break;           /* end of line or unparseable field */
+    }
+
+    row.n = col;
+
+    if (row.n < CSV_MIN_COLS)
+        row.valid = 0;   /* not enough columns – discard */
+
+    return row;
+}
+
+/* ============================================================================
+ * SECTION 6 – UTILITY FUNCTIONS
+ * ============================================================================ */
+
+/**
+ * bytes_to_hex() – convert a byte array to an uppercase hex string.
+ *
+ * @buf : source byte array
+ * @n   : number of bytes
+ * @out : destination string; must have space for at least (n*2 + 1) bytes
+ */
+static void bytes_to_hex(const uint8_t *buf, int n, char *out)
+{
+    for (int i = 0; i < n; i++)
+        sprintf(out + i * 2, "%02X", buf[i]);
+    out[n * 2] = '\0';
+}
+
+/**
+ * sleep_until_next_2s_boundary() – busy-wait/sleep until the next 2-second
+ * wall-clock boundary.
+ *
+ * In the StoryBoard, each unique frame number represents a 2-second epoch
+ * (matching the TDMA superframe period of the TCAS radio link).  Before
+ * transmitting the next frame group we sleep to the next 2-second boundary
+ * so real-time pacing is accurate.
+ *
+ * Uses nanosleep() for POSIX compliance.
+ */
+static void sleep_until_next_2s_boundary(void)
+{
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+
+    /*
+     * Time within the current 2-second window (in nanoseconds):
+     *   elapsed_ns = (now.tv_sec % 2) * 1e9 + now.tv_nsec
+     * Remaining until next boundary:
+     *   remain_ns  = 2e9 - elapsed_ns
+     */
+    long long elapsed_ns = (long long)(now.tv_sec % 2) * 1000000000LL
+                           + (long long)now.tv_nsec;
+    long long remain_ns  = 2000000000LL - elapsed_ns;
+
+    if (remain_ns <= 0)
+        remain_ns = 2000000000LL;   /* already on boundary; wait full 2s */
+
+    struct timespec ts;
+    ts.tv_sec  = (time_t)(remain_ns / 1000000000LL);
+    ts.tv_nsec = (long)  (remain_ns % 1000000000LL);
+
+    nanosleep(&ts, NULL);
+}
+
+/* ============================================================================
+ * SECTION 7 – ANNEXURE-C PACKET ENCODERS
+ *
+ * Each encoder receives:
+ *   @r  : pointer to a validated CsvRow with .n >= CSV_MIN_COLS
+ *   @bw : pointer to a zero-initialised BitWriter
+ *
+ * Returns 0 on success, -1 on internal error.
+ *
+ * Field widths are annotated in comments for every bw_write() call so
+ * engineers can verify them against the standard without reading code logic.
+ * ============================================================================ */
+
+/*
+ * §C.4.2  Station / ILC / IBS → Onboard Regular Packet  (PKT_TYPE = 9)
+ *
+ * OUTER HEADER  (bits after PKT_TYPE + PKT_LENGTH):
+ *  ┌─ Field ──────────────────┬── Bits ──┬─ Source column ─┐
+ *  │ FRAME_NUM                │  17      │ v[3]             │
+ *  │ SOURCE_STN_ID            │  16      │ v[4]             │
+ *  │ SOURCE_STN_VER           │   3      │ v[5]             │
+ *  │ DEST_LOCO_ID             │  20      │ v[6]             │
+ *  │ REF_PROF_ID              │   4      │ v[7]             │
+ *  │ LAST_REF_RFID            │  10      │ v[8]             │
+ *  │ DIST_PKT_START (signed)  │  15      │ v[9]             │
+ *  │ PKT_DIR                  │   2      │ v[10]            │
+ *  │ Padding                  │   3      │ 0                │
+ *  └──────────────────────────┴──────────┴──────────────────┘
+ *  Total outer header bits: 17+16+3+20+4+10+15+2+3 = 90
+ *
+ * MA SUB-PACKET  (SUB_PKT_TYPE = 0):
+ *  ┌─ Field ──────────────────┬── Bits ──┬─ Source column ─┐
+ *  │ SUB_PKT_TYPE             │   4      │ constant 0       │
+ *  │ SUB_PKT_LENGTH           │   7      │ back-filled      │
+ *  │ FRAME_OFFSET             │   4      │ v[13]            │
+ *  │ DEST_LOCO_SOS            │   4      │ v[14]            │
+ *  │ TRAIN_SECTION_TYPE       │   2      │ v[15]            │
+ *  │ CUR_SIG_INFO             │  17      │ v[16]            │
+ *  │ CUR_SIG_ASPECT           │   6      │ v[17]            │
+ *  │ NEXT_SIG_ASPECT          │   6      │ v[18]            │
+ *  │ APPR_SIG_DIST            │  15      │ v[19]            │
+ *  │ AUTHORITY_TYPE           │   2      │ v[20]            │
+ *  │ AUTHORIZED_SPEED         │   6      │ v[21] ÷5 if >50  │
+ *  │ MA_W_R_T_SIG             │  16      │ v[22]            │
+ *  │ REQ_SHORTEN_MA           │   1      │ v[23] != 0       │
+ *  │ NEW_MA (if above = 1)    │  16      │ v[23]            │
+ *  │ TRN_LEN_INFO_STS         │   1      │ v[25]            │
+ *  │ TRN_LEN_INFO_TYPE        │   1      │ v[26] (if STS=1) │
+ *  │ REF_FRAME_NUM_TLM        │  17      │ v[27] (if STS=1) │
+ *  │ REF_OFFSET_INT_TLM       │   8      │ v[28] (if STS=1) │
+ *  │ NEXT_STN_COMM            │   1      │ v[29]            │
+ *  │ APPR_STN_ILC_IBS_ID      │  16      │ v[30] (if HO=1)  │
+ *  │ [byte padding]           │ 0..7     │ 0                │
+ *  └──────────────────────────┴──────────┴──────────────────┘
+ *
+ * FOOTER:
+ *  │ CBC_MAC                  │  32      │ v[33]            │
+ *  │ PKT_CRC                  │  32      │ v[34]            │
+ *
+ * TOTAL BYTES:
+ *   total_bits  = 4 + 10 + 90 + sp_bytes×8 + 64
+ *   total_bytes = ceil(total_bits / 8)
+ *   PKT_LENGTH  = total_bytes − 1
+ */
+static int encode_pkt9(const CsvRow *r, BitWriter *bw)
+{
+    /* --- Extract CSV fields --- */
+    long long frameNum     = r->v[3];
+    long long srcStnId     = r->v[4];
+    long long srcStnVer    = r->v[5];
+    long long locoId       = r->v[6];
+    long long refProfNum   = r->v[7];
+    long long lastRefRfid  = r->v[8];
+    long long distPktStart = r->v[9];   /* signed – may be negative */
+    long long pktDir       = r->v[10];
+    long long frameOffset  = r->v[13];
+    long long sos          = r->v[14];
+    long long secType      = r->v[15];
+    long long curSigInfo   = r->v[16];
+    long long curSigAsp    = r->v[17];
+    long long nxtSigAsp    = r->v[18];
+    long long apprSigDist  = r->v[19];
+    long long authType     = r->v[20];
+    long long authSpeed    = r->v[21];
+    long long ma           = r->v[22];
+    long long shortMA      = r->v[23];
+    long long TLsts        = r->v[25];
+    long long TLtype       = r->v[26];
+    long long refFN        = r->v[27];
+    long long refOff       = r->v[28];
+    long long nxtStnHO     = r->v[29];
+    long long nxtStnId     = r->v[30];
+    long long cbcMac       = r->v[33];
+    long long crc          = r->v[34];
+
+    /* ── Build MA sub-packet in a temporary BitWriter ── */
+    BitWriter sp;
+    bw_init(&sp);
+
+    bw_write(&sp, 0x0, 4);                        /* SUB_PKT_TYPE = 0 (MA)     */
+
+    int sp_len_bit_pos = sp.bit_pos;               /* remember position for     */
+    bw_write(&sp, 0x0, 7);                         /* SUB_PKT_LENGTH placeholder */
+
+    bw_write(&sp, (uint64_t)frameOffset,   4);     /* FRAME_OFFSET              */
+    bw_write(&sp, (uint64_t)sos,           4);     /* DEST_LOCO_SOS             */
+    bw_write(&sp, (uint64_t)secType,       2);     /* TRAIN_SECTION_TYPE        */
+    bw_write(&sp, (uint64_t)curSigInfo,   17);     /* CUR_SIG_INFO              */
+    bw_write(&sp, (uint64_t)curSigAsp,     6);     /* CUR_SIG_ASPECT            */
+    bw_write(&sp, (uint64_t)nxtSigAsp,     6);     /* NEXT_SIG_ASPECT           */
+    bw_write(&sp, (uint64_t)apprSigDist,  15);     /* APPR_SIG_DIST             */
+    bw_write(&sp, (uint64_t)authType,      2);     /* AUTHORITY_TYPE            */
+
+    /*
+     * AUTHORIZED_SPEED encoding:
+     *   If the raw speed in the CSV exceeds 50 km/h, encode as (kmph / 5)
+     *   to fit within 6 bits (max encoded value = 200/5 = 40).
+     *   If ≤ 50 km/h, encode raw (direct fit in 6 bits).
+     */
+    long long speedCode = (authSpeed > 50) ? (authSpeed / 5) : authSpeed;
+    bw_write(&sp, (uint64_t)speedCode,     6);     /* AUTHORIZED_SPEED          */
+
+    bw_write(&sp, (uint64_t)ma,           16);     /* MA_W_R_T_SIG              */
+
+    int shortenFlag = (shortMA != 0) ? 1 : 0;
+    bw_write(&sp, (uint64_t)shortenFlag,   1);     /* REQ_SHORTEN_MA            */
+    if (shortenFlag)
+        bw_write(&sp, (uint64_t)shortMA,  16);     /* NEW_MA (conditional)      */
+
+    bw_write(&sp, (uint64_t)TLsts,         1);     /* TRN_LEN_INFO_STS          */
+    if (TLsts) {
+        bw_write(&sp, (uint64_t)TLtype,    1);     /* TRN_LEN_INFO_TYPE (cond.) */
+        bw_write(&sp, (uint64_t)refFN,    17);     /* REF_FRAME_NUM_TLM (cond.) */
+        bw_write(&sp, (uint64_t)refOff,    8);     /* REF_OFFSET_INT_TLM(cond.) */
+    }
+
+    bw_write(&sp, (uint64_t)nxtStnHO,     1);     /* NEXT_STN_COMM             */
+    if (nxtStnHO)
+        bw_write(&sp, (uint64_t)nxtStnId, 16);    /* APPR_STN_ILC_IBS_ID(cond.)*/
+
+    /* Pad sub-packet to next byte boundary */
+    int sp_bits  = sp.bit_pos;
+    int sp_bytes = (sp_bits + 7) / 8;
+    int pad_bits = sp_bytes * 8 - sp_bits;
+    if (pad_bits > 0)
+        bw_write(&sp, 0, pad_bits);
+
+    /* Back-fill SUB_PKT_LENGTH = (sp_bytes − 1) into the placeholder */
+    bw_backfill_7bit(&sp, sp_len_bit_pos, (uint8_t)(sp_bytes - 1));
+
+    /* ── Compute full packet metrics ── */
+    int total_bits  = 4 + 10 + 90 + sp_bytes * 8 + 64;
+    int total_bytes = (total_bits + 7) / 8;
+
+    /* ── Write full packet to output BitWriter ── */
+    bw_write(bw, 0x9,                          4);   /* PKT_TYPE = 9             */
+    bw_write(bw, (uint64_t)(total_bytes - 1), 10);   /* PKT_LENGTH               */
+    bw_write(bw, (uint64_t)frameNum,          17);   /* FRAME_NUM                */
+    bw_write(bw, (uint64_t)srcStnId,          16);   /* SOURCE_STN_ID            */
+    bw_write(bw, (uint64_t)srcStnVer,          3);   /* SOURCE_STN_VER           */
+    bw_write(bw, (uint64_t)locoId,            20);   /* DEST_LOCO_ID             */
+    bw_write(bw, (uint64_t)refProfNum,         4);   /* REF_PROF_ID              */
+    bw_write(bw, (uint64_t)lastRefRfid,       10);   /* LAST_REF_RFID            */
+    bw_write_signed(bw, (int64_t)distPktStart,15);   /* DIST_PKT_START (signed)  */
+    bw_write(bw, (uint64_t)pktDir,             2);   /* PKT_DIR                  */
+    bw_write(bw, 0,                            3);   /* Padding                  */
+
+    /* Append sub-packet bytes */
+    for (int i = 0; i < sp_bytes; i++)
+        bw_write(bw, sp.buf[i], 8);
+
+    /* Footer */
+    bw_write(bw, (uint64_t)(uint32_t)cbcMac, 32);   /* CBC_MAC                  */
+    bw_write(bw, (uint64_t)(uint32_t)crc,    32);   /* PKT_CRC                  */
+
+    return 0;
+}
+
+/*
+ * §C.4.3  Onboard → Station Regular Packet  (PKT_TYPE = 10)
+ *
+ * Fixed structure, 29 bytes (232 bits):
+ *  ┌─ Field ──────────────────┬── Bits ──┬─ Source column ─┐
+ *  │ PKT_TYPE                 │   4      │ constant 0xA     │
+ *  │ PKT_LENGTH               │   7      │ 28 (29-1)        │
+ *  │ FRAME_NUM                │  17      │ v[3]             │
+ *  │ SOURCE_LOCO_ID           │  20      │ v[6]             │
+ *  │ SOURCE_LOCO_VER          │   3      │ v[5]             │
+ *  │ ABS_LOCO_LOC             │  23      │ 0 (unknown)      │
+ *  │ L_DOUBTOVER              │   9      │ 0                │
+ *  │ L_DOUBTUNDER             │   9      │ 0                │
+ *  │ TRAIN_INT                │   2      │ 0                │
+ *  │ TRAIN_LENGTH             │  11      │ 0                │
+ *  │ TRAIN_SPEED              │   9      │ v[21] (÷5 if>50) │
+ *  │ MOVEMENT_DIR             │   2      │ v[10]            │
+ *  │ EMERGENCY_STATUS         │   3      │ v[14]            │
+ *  │ LOCO_MODE                │   4      │ v[15]            │
+ *  │ LAST_RFID_TAG            │  10      │ v[8]             │
+ *  │ TAG_DUP                  │   1      │ 0                │
+ *  │ TAG_LINK_INFO            │   3      │ 0                │
+ *  │ TIN                      │   9      │ 0                │
+ *  │ Brake_Applied            │   3      │ 0                │
+ *  │ NEW_MA_REPLY             │   2      │ 0                │
+ *  │ LAST_REF_PROFILE         │   4      │ v[7]             │
+ *  │ SIG_OV                   │   1      │ 0                │
+ *  │ Info_Ack                 │   4      │ 0                │
+ *  │ Spare                    │   2      │ 0                │
+ *  │ Loco_Health_Status       │   6      │ 0                │
+ *  │ MAC_CODE                 │  32      │ v[33]            │
+ *  │ PKT_CRC                  │  32      │ v[34]            │
+ *  └──────────────────────────┴──────────┴──────────────────┘
+ *  Sum: 4+7+17+20+3+23+9+9+2+11+9+2+3+4+10+1+3+9+3+2+4+1+4+2+6+32+32 = 232 ✓
+ */
+static int encode_pkt10(const CsvRow *r, BitWriter *bw)
+{
+    long long frameNum    = r->v[3];
+    long long locoId      = r->v[6];
+    long long srcStnVer   = r->v[5];
+    long long lastRefRfid = r->v[8];
+    long long pktDir      = r->v[10];
+    long long sos         = r->v[14];
+    long long secType     = r->v[15];
+    long long authSpeed   = r->v[21];
+    long long refProfNum  = r->v[7];
+    long long cbcMac      = r->v[33];
+    long long crc         = r->v[34];
+
+    long long speedCode   = (authSpeed > 50) ? (authSpeed / 5) : authSpeed;
+    int total_bytes       = 29;
+
+    bw_write(bw, 0xA,                           4);  /* PKT_TYPE = 10            */
+    bw_write(bw, (uint64_t)(total_bytes - 1),   7);  /* PKT_LENGTH               */
+    bw_write(bw, (uint64_t)frameNum,           17);  /* FRAME_NUM                */
+    bw_write(bw, (uint64_t)locoId,             20);  /* SOURCE_LOCO_ID           */
+    bw_write(bw, (uint64_t)srcStnVer,           3);  /* SOURCE_LOCO_VER          */
+    bw_write(bw, 0,                            23);  /* ABS_LOCO_LOC             */
+    bw_write(bw, 0,                             9);  /* L_DOUBTOVER              */
+    bw_write(bw, 0,                             9);  /* L_DOUBTUNDER             */
+    bw_write(bw, 0,                             2);  /* TRAIN_INT                */
+    bw_write(bw, 0,                            11);  /* TRAIN_LENGTH             */
+    bw_write(bw, (uint64_t)speedCode,           9);  /* TRAIN_SPEED              */
+    bw_write(bw, (uint64_t)pktDir,              2);  /* MOVEMENT_DIR             */
+    bw_write(bw, (uint64_t)sos,                 3);  /* EMERGENCY_STATUS         */
+    bw_write(bw, (uint64_t)secType,             4);  /* LOCO_MODE                */
+    bw_write(bw, (uint64_t)lastRefRfid,        10);  /* LAST_RFID_TAG            */
+    bw_write(bw, 0,                             1);  /* TAG_DUP                  */
+    bw_write(bw, 0,                             3);  /* TAG_LINK_INFO            */
+    bw_write(bw, 0,                             9);  /* TIN                      */
+    bw_write(bw, 0,                             3);  /* Brake_Applied            */
+    bw_write(bw, 0,                             2);  /* NEW_MA_REPLY             */
+    bw_write(bw, (uint64_t)refProfNum,          4);  /* LAST_REF_PROFILE         */
+    bw_write(bw, 0,                             1);  /* SIG_OV                   */
+    bw_write(bw, 0,                             4);  /* Info_Ack                 */
+    bw_write(bw, 0,                             2);  /* Spare                    */
+    bw_write(bw, 0,                             6);  /* Loco_Health_Status       */
+    bw_write(bw, (uint64_t)(uint32_t)cbcMac,  32);  /* MAC_CODE                 */
+    bw_write(bw, (uint64_t)(uint32_t)crc,     32);  /* PKT_CRC                  */
+
+    return 0;
+}
+
+/*
+ * §C.4.4  Access Authority Packet v2.0  (PKT_TYPE = 11)
+ *
+ * Fixed structure, 26 bytes (208 bits):
+ *  ┌─ Field ──────────────────┬── Bits ──┬─ Source column ─┐
+ *  │ PKT_TYPE                 │   4      │ constant 0xB     │
+ *  │ PKT_LENGTH               │   7      │ 25 (26-1)        │
+ *  │ FRAME_NUM                │  17      │ v[3]             │
+ *  │ SOURCE_STN_ID            │  16      │ v[4]             │
+ *  │ SOURCE_STN_VER           │   3      │ v[5]             │
+ *  │ STN_ILC_IBS_LOC          │  23      │ 0                │
+ *  │ DEST_LOCO_ID             │  20      │ v[6]             │
+ *  │ Allotted_UpLink_Freq     │  12      │ 0 (not used)     │
+ *  │ Allotted_DownLink_Freq   │  12      │ 0 (not used)     │
+ *  │ Allotted_TDMA_Timeslot   │   7      │ v[0]             │
+ *  │ STN_RND_NUM_RS           │  16      │ 0                │
+ *  │ STN_TDMA                 │   7      │ 0x7F (not used)  │
+ *  │ MAC_CODE                 │  32      │ v[33]            │
+ *  │ PKT_CRC                  │  32      │ v[34]            │
+ *  └──────────────────────────┴──────────┴──────────────────┘
+ *  Sum: 4+7+17+16+3+23+20+12+12+7+16+7+32+32 = 208 ✓
+ */
+static int encode_pkt11(const CsvRow *r, BitWriter *bw)
+{
+    long long tdmaSlot  = r->v[0];
+    long long frameNum  = r->v[3];
+    long long srcStnId  = r->v[4];
+    long long srcStnVer = r->v[5];
+    long long locoId    = r->v[6];
+    long long cbcMac    = r->v[33];
+    long long crc       = r->v[34];
+
+    int total_bytes = 26;
+
+    bw_write(bw, 0xB,                           4);  /* PKT_TYPE = 11            */
+    bw_write(bw, (uint64_t)(total_bytes - 1),   7);  /* PKT_LENGTH               */
+    bw_write(bw, (uint64_t)frameNum,           17);  /* FRAME_NUM                */
+    bw_write(bw, (uint64_t)srcStnId,           16);  /* SOURCE_STN_ID            */
+    bw_write(bw, (uint64_t)srcStnVer,           3);  /* SOURCE_STN_VER           */
+    bw_write(bw, 0,                            23);  /* STN_ILC_IBS_LOC          */
+    bw_write(bw, (uint64_t)locoId,             20);  /* DEST_LOCO_ID             */
+    bw_write(bw, 0,                            12);  /* Allotted_UpLink_Freq     */
+    bw_write(bw, 0,                            12);  /* Allotted_DownLink_Freq   */
+    bw_write(bw, (uint64_t)tdmaSlot,            7);  /* Allotted_TDMA_Timeslot   */
+    bw_write(bw, 0,                            16);  /* STN_RND_NUM_RS           */
+    bw_write(bw, 0x7F,                          7);  /* STN_TDMA = not used      */
+    bw_write(bw, (uint64_t)(uint32_t)cbcMac,  32);  /* MAC_CODE                 */
+    bw_write(bw, (uint64_t)(uint32_t)crc,     32);  /* PKT_CRC                  */
+
+    return 0;
+}
+
+/*
+ * §C.4.5  Additional Emergency Packet  (PKT_TYPE = 12)
+ *
+ * Fixed structure, 13 bytes (104 bits):
+ *  ┌─ Field ──────────────────┬── Bits ──┬─ Source column ─┐
+ *  │ PKT_TYPE                 │   4      │ constant 0xC     │
+ *  │ PKT_LENGTH               │   7      │ 12 (13-1)        │
+ *  │ FRAME_NUM                │  17      │ v[3]             │
+ *  │ SOURCE_STN_ID            │  16      │ v[4]             │
+ *  │ SOURCE_STN_VER           │   3      │ v[5]             │
+ *  │ STN_ILC_IBS_LOC          │  23      │ 0                │
+ *  │ GEN_SOS_CALL             │   1      │ v[14] != 0 → 1   │
+ *  │ Padding                  │   1      │ 0                │
+ *  │ PKT_CRC                  │  32      │ v[34]            │
+ *  └──────────────────────────┴──────────┴──────────────────┘
+ *  Sum: 4+7+17+16+3+23+1+1+32 = 104 ✓
+ *
+ * NOTE: PKT_TYPE 12 carries no CBC_MAC (it is an emergency broadcast).
+ */
+static int encode_pkt12(const CsvRow *r, BitWriter *bw)
+{
+    long long frameNum  = r->v[3];
+    long long srcStnId  = r->v[4];
+    long long srcStnVer = r->v[5];
+    long long sos       = r->v[14];
+    long long crc       = r->v[34];
+
+    int total_bytes = 13;
+
+    bw_write(bw, 0xC,                           4);  /* PKT_TYPE = 12            */
+    bw_write(bw, (uint64_t)(total_bytes - 1),   7);  /* PKT_LENGTH               */
+    bw_write(bw, (uint64_t)frameNum,           17);  /* FRAME_NUM                */
+    bw_write(bw, (uint64_t)srcStnId,           16);  /* SOURCE_STN_ID            */
+    bw_write(bw, (uint64_t)srcStnVer,           3);  /* SOURCE_STN_VER           */
+    bw_write(bw, 0,                            23);  /* STN_ILC_IBS_LOC          */
+    bw_write(bw, sos ? 1ULL : 0ULL,             1);  /* GEN_SOS_CALL             */
+    bw_write(bw, 0,                             1);  /* Padding                  */
+    bw_write(bw, (uint64_t)(uint32_t)crc,      32);  /* PKT_CRC                  */
+
+    return 0;
+}
+
+/*
+ * §C.4.6  Onboard Access Request Packet  (PKT_TYPE = 13)
+ *
+ * Fixed structure, 29 bytes (232 bits):
+ *  ┌─ Field ──────────────────┬── Bits ──┬─ Source column ─┐
+ *  │ PKT_TYPE                 │   4      │ constant 0xD     │
+ *  │ PKT_LENGTH               │   7      │ 28 (29-1)        │
+ *  │ FRAME_NUM                │  17      │ v[3]             │
+ *  │ SOURCE_LOCO_ID           │  20      │ v[6]             │
+ *  │ SOURCE_LOCO_VER          │   3      │ v[5]             │
+ *  │ ABS_LOCO_LOC             │  23      │ 0                │
+ *  │ TRAIN_LENGTH             │  11      │ 0                │
+ *  │ TRAIN_SPEED (raw km/h)   │   9      │ v[21]            │
+ *  │ MOVEMENT_DIR             │   2      │ v[10]            │
+ *  │ EMERGENCY_STATUS         │   3      │ v[14]            │
+ *  │ LOCO_MODE                │   4      │ v[15]            │
+ *  │ Approaching_STN_ID       │  16      │ v[4]             │
+ *  │ LAST_RFID_TAG            │  10      │ v[8]             │
+ *  │ TIN                      │   9      │ 0                │
+ *  │ Longitude                │  21      │ 0                │
+ *  │ Latitude                 │  20      │ 0                │
+ *  │ LOCO_RND_NUM_RL          │  16      │ 0                │
+ *  │ Padding                  │   5      │ 0                │
+ *  │ PKT_CRC                  │  32      │ v[34]            │
+ *  └──────────────────────────┴──────────┴──────────────────┘
+ *  Sum: 4+7+17+20+3+23+11+9+2+3+4+16+10+9+21+20+16+5+32 = 232 ✓
+ *
+ * NOTE: PKT_TYPE 13 carries no CBC_MAC (access-request packet).
+ * NOTE: TRAIN_SPEED for PKT13 is raw km/h (9 bits, max 511 km/h);
+ *       no ÷5 scaling is applied for this packet type.
+ */
+static int encode_pkt13(const CsvRow *r, BitWriter *bw)
+{
+    long long frameNum    = r->v[3];
+    long long srcStnId    = r->v[4];
+    long long srcStnVer   = r->v[5];
+    long long locoId      = r->v[6];
+    long long lastRefRfid = r->v[8];
+    long long pktDir      = r->v[10];
+    long long sos         = r->v[14];
+    long long secType     = r->v[15];
+    long long authSpeed   = r->v[21];
+    long long crc         = r->v[34];
+
+    int total_bytes = 29;
+
+    bw_write(bw, 0xD,                           4);  /* PKT_TYPE = 13            */
+    bw_write(bw, (uint64_t)(total_bytes - 1),   7);  /* PKT_LENGTH               */
+    bw_write(bw, (uint64_t)frameNum,           17);  /* FRAME_NUM                */
+    bw_write(bw, (uint64_t)locoId,             20);  /* SOURCE_LOCO_ID           */
+    bw_write(bw, (uint64_t)srcStnVer,           3);  /* SOURCE_LOCO_VER          */
+    bw_write(bw, 0,                            23);  /* ABS_LOCO_LOC             */
+    bw_write(bw, 0,                            11);  /* TRAIN_LENGTH             */
+    bw_write(bw, (uint64_t)authSpeed,           9);  /* TRAIN_SPEED (raw km/h)   */
+    bw_write(bw, (uint64_t)pktDir,              2);  /* MOVEMENT_DIR             */
+    bw_write(bw, (uint64_t)sos,                 3);  /* EMERGENCY_STATUS         */
+    bw_write(bw, (uint64_t)secType,             4);  /* LOCO_MODE                */
+    bw_write(bw, (uint64_t)srcStnId,           16);  /* Approaching_STN_ID       */
+    bw_write(bw, (uint64_t)lastRefRfid,        10);  /* LAST_RFID_TAG            */
+    bw_write(bw, 0,                             9);  /* TIN                      */
+    bw_write(bw, 0,                            21);  /* Longitude                */
+    bw_write(bw, 0,                            20);  /* Latitude                 */
+    bw_write(bw, 0,                            16);  /* LOCO_RND_NUM_RL          */
+    bw_write(bw, 0,                             5);  /* Padding                  */
+    bw_write(bw, (uint64_t)(uint32_t)crc,      32);  /* PKT_CRC                  */
+
+    return 0;
+}
+
+/* ============================================================================
+ * SECTION 8 – SHARED ENCODE DISPATCH
+ *
+ * Centralises the switch(pkt_type) logic so it is used identically by both
+ * encode_storyboard_csv() and transmit_storyboard_csv(), avoiding any
+ * divergence between the two code paths.
+ * ============================================================================ */
+
+/**
+ * dispatch_encode() – encode one CSV row into a BitWriter using the
+ * packet-type-specific encoder.
+ *
+ * @r   : validated CsvRow
+ * @bw  : zero-initialised BitWriter to write into
+ *
+ * Returns:
+ *   0  – success
+ *  -1  – encoder reported an error
+ *  -2  – packet type not supported (pkt_type outside 9..13)
+ */
+static int dispatch_encode(const CsvRow *r, BitWriter *bw)
+{
+    int pkt_type = (int)r->v[1];
+
+    switch (pkt_type) {
+        case  9: return encode_pkt9 (r, bw);
+        case 10: return encode_pkt10(r, bw);
+        case 11: return encode_pkt11(r, bw);
+        case 12: return encode_pkt12(r, bw);
+        case 13: return encode_pkt13(r, bw);
+        default: return -2;
+    }
+}
+
+/* ============================================================================
+ * SECTION 9 – encode_storyboard_csv()  (PUBLIC API)
+ *
+ * Encodes the full CSV storyboard into a JSON array of encoded-packet records.
+ *
+ * Output JSON per row:
+ *   {
+ *     "row":           <data-row index>,
+ *     "line_num":      <absolute CSV line number>,
+ *     "tdma_slot":     <column 0 value>,
+ *     "frame_num":     <column 3 value>,
+ *     "pkt_type":      <column 1 value>,
+ *     "pkt_type_name": "<human-readable name>",
+ *     "byte_len":      <encoded byte count>,
+ *     "hex":           "<uppercase hex string>",
+ *     "error":         "<error description, or empty string>"
+ *   }
+ * ============================================================================ */
+
+/**
+ * Packet type names indexed by pkt_type (0..15).
+ * Types outside the supported range are labelled "Unknown".
+ */
+static const char * const PKT_TYPE_NAME[16] = {
+    /* 0 */ "",
+    /* 1 */ "",
+    /* 2 */ "",
+    /* 3 */ "",
+    /* 4 */ "",
+    /* 5 */ "",
+    /* 6 */ "",
+    /* 7 */ "",
+    /* 8 */ "",
+    /* 9 */ "Station to Onboard Regular Packet",
+    /*10 */ "Onboard to Station Regular Packet",
+    /*11 */ "Access Authority Packet v2.0",
+    /*12 */ "Additional Emergency Packet",
+    /*13 */ "Onboard Access Request Packet",
+    /*14 */ "",
+    /*15 */ ""
+};
+
+int encode_storyboard_csv(const char *csv_text, char *out_json, int out_len)
+{
+    if (!csv_text || !out_json || out_len < 64) return -1;
+
+    int pos = 0;
+    int rc_append;
+
+#define JAPP(...) do { \
+    rc_append = buf_append(out_json, &pos, out_len, __VA_ARGS__); \
+    if (rc_append < 0) return -1; \
+} while (0)
+
+    JAPP("[");
+
+    const char *line_start = csv_text;
+    int row_idx    = 0;  /* count of valid data rows encoded */
+    int line_num   = 0;  /* absolute line number for diagnostics */
+    int first_item = 1;
+
+    while (*line_start) {
+        /* Find end of line (handles both \r\n and \n) */
+        const char *line_end = line_start;
+        while (*line_end && *line_end != '\n' && *line_end != '\r')
+            line_end++;
+
+        line_num++;
+
+        int line_len = (int)(line_end - line_start);
+        if (line_len >= 2048) line_len = 2047;
+
+        char line_buf[2048];
+        memcpy(line_buf, line_start, line_len);
+        line_buf[line_len] = '\0';
+
+        /* Advance past CR/LF */
+        line_start = line_end;
+        if (*line_start == '\r') line_start++;
+        if (*line_start == '\n') line_start++;
+
+        CsvRow row = parse_csv_row(line_buf);
+        if (!row.valid) continue;   /* skip comment, blank, or malformed */
+
+        row_idx++;
+
+        int pkt_type  = (int)row.v[1];
+        long long tdma_slot = row.v[0];
+        long long frame_num = row.v[3];
+
+        /* Encode packet */
+        BitWriter bw;
+        bw_init(&bw);
+        int enc_rc = dispatch_encode(&row, &bw);
+
+        int  byte_len = bw_byte_len(&bw);
+        char hex_buf[2100] = "";
+        if (enc_rc == 0)
+            bytes_to_hex(bw.buf, byte_len, hex_buf);
+
+        const char *type_name = (pkt_type >= 0 && pkt_type < 16)
+                                 ? PKT_TYPE_NAME[pkt_type] : "Unknown";
+        if (!type_name || !type_name[0]) type_name = "Unknown";
+
+        char err_buf[80] = "";
+        if (enc_rc == -2)
+            snprintf(err_buf, sizeof(err_buf),
+                     "Unsupported pkt_type %d", pkt_type);
+        else if (enc_rc != 0)
+            snprintf(err_buf, sizeof(err_buf),
+                     "Encoding error (pkt_type %d)", pkt_type);
+
+        if (!first_item) JAPP(",");
+        first_item = 0;
+
+        JAPP("{\"row\":%d,\"line_num\":%d,\"tdma_slot\":%lld,"
+             "\"frame_num\":%lld,"
+             "\"pkt_type\":%d,\"pkt_type_name\":\"%s\","
+             "\"byte_len\":%d,\"hex\":\"%s\",\"error\":\"%s\"}",
+             row_idx, line_num, tdma_slot, frame_num,
+             pkt_type, type_name,
+             byte_len, hex_buf, err_buf);
+    }
+
+    JAPP("]");
+#undef JAPP
+    return 0;
+}
+
+/* ============================================================================
+ * SECTION 10 – transmit_storyboard_csv()  (PUBLIC API – NEW)
+ *
+ * OVERVIEW
+ * --------
+ * Reads the CSV storyboard, encodes every valid data row, then transmits each
+ * encoded packet as a UDP datagram to the remote SVK Stresser endpoint.
+ *
+ * TIMING MODEL
+ * ------------
+ * The CSV storyboard represents a time-ordered sequence of TDMA frames.
+ * Column 3 (frameNum) identifies which 2-second epoch each row belongs to:
+ * rows with the same frameNum are part of the same frame-group and are
+ * transmitted in rapid succession.  After all rows in a frame-group are sent,
+ * the function sleeps until the next 2-second wall-clock boundary before
+ * processing the next frame-group.  This faithfully reproduces the real-time
+ * behaviour of an SVK station's radio transmission schedule.
+ *
+ * PARAMETERS
+ * ----------
+ * @csv_text    NUL-terminated string containing the full CSV file content.
+ * @dest_ip     IPv4 address string of the remote SVK Stresser (e.g. "192.168.1.5").
+ * @dest_port   UDP destination port number (1–65535).
+ * @loop        0 = play the storyboard once and return;
+ *              1 = loop continuously until *stop_flag becomes non-zero.
+ * @stop_flag   Pointer to a volatile int; set to 1 from another thread or
+ *              signal handler to abort an in-progress (or looping) run.
+ *              Pass NULL if you do not need external abort capability.
+ *
+ * RETURN VALUES
+ * -------------
+ *   0  – completed (all rows sent, or stopped cleanly via stop_flag)
+ *  -1  – invalid argument (csv_text or dest_ip is NULL, port out of range)
+ *  -2  – socket / address setup failure (check errno)
+ *  -3  – encoding error for one or more rows
+ *
+ * NOTES
+ * -----
+ * • The function opens a single UDP socket for the entire run (or loop) and
+ *   closes it before returning.  This is intentional: re-using the socket
+ *   avoids the overhead of repeated open/close during a high-rate burst.
+ * • Only encoding errors cause -3 to be returned; unsupported packet types
+ *   are silently skipped (the row is logged to stderr if SVK_VERBOSE is
+ *   defined at compile time).
+ * • The function is NOT thread-safe with respect to the same csv_text buffer;
+ *   do not modify the buffer while this function is running.
+ * ============================================================================ */
+
+int transmit_storyboard_csv(const char  *csv_text,
+                             const char  *dest_ip,
+                             int          dest_port,
+                             int          loop,
+                             volatile int *stop_flag)
+{
+    /* ── Argument validation ── */
+    if (!csv_text || !dest_ip)         return -1;
+    if (dest_port < 1 || dest_port > 65535) return -1;
+
+    /* ── First pass: parse all rows into heap memory ── */
+    /*
+     * We parse the CSV once into an array of (CsvRow, encoded bytes, byte_len)
+     * so the transmission loop itself is free of dynamic parsing overhead and
+     * deterministic in timing.
+     */
+
+    /* Count valid rows first */
+    int total_rows = 0;
+    {
+        const char *p = csv_text;
+        while (*p) {
+            const char *eol = p;
+            while (*eol && *eol != '\n' && *eol != '\r') eol++;
+            char lbuf[2048];
+            int  llen = (int)(eol - p);
+            if (llen >= 2048) llen = 2047;
+            memcpy(lbuf, p, llen);
+            lbuf[llen] = '\0';
+            CsvRow r = parse_csv_row(lbuf);
+            if (r.valid) total_rows++;
+            p = eol;
+            if (*p == '\r') p++;
+            if (*p == '\n') p++;
+        }
+    }
+
+    if (total_rows == 0) return 0;   /* nothing to send */
+
+    /*
+     * Allocate a flat array to hold each row's encoded packet.
+     * Max packet size per encode: 1024 bytes (BitWriter buffer size).
+     */
+    typedef struct {
+        long long frame_num;          /* for grouping by 2-second epoch */
+        long long tdma_slot;          /* for diagnostics */
+        int       pkt_type;
+        uint8_t   pkt_buf[1024];      /* encoded packet bytes */
+        int       pkt_len;            /* valid bytes in pkt_buf */
+        int       enc_error;          /* 0 = ok, -1 = error, -2 = unsupported */
+    } EncodedRow;
+
+    EncodedRow *rows = (EncodedRow *)malloc((size_t)total_rows * sizeof(EncodedRow));
+    if (!rows) return -2;   /* out of memory treated as resource failure */
+
+    /* Second pass: parse and encode every valid row */
+    int row_idx = 0;
+    {
+        const char *p = csv_text;
+        while (*p && row_idx < total_rows) {
+            const char *eol = p;
+            while (*eol && *eol != '\n' && *eol != '\r') eol++;
+            char lbuf[2048];
+            int  llen = (int)(eol - p);
+            if (llen >= 2048) llen = 2047;
+            memcpy(lbuf, p, llen);
+            lbuf[llen] = '\0';
+
+            CsvRow r = parse_csv_row(lbuf);
+            if (r.valid) {
+                EncodedRow *er = &rows[row_idx];
+                er->frame_num = r.v[3];
+                er->tdma_slot = r.v[0];
+                er->pkt_type  = (int)r.v[1];
+
+                BitWriter bw;
+                bw_init(&bw);
+                er->enc_error = dispatch_encode(&r, &bw);
+
+                if (er->enc_error == 0) {
+                    er->pkt_len = bw_byte_len(&bw);
+                    memcpy(er->pkt_buf, bw.buf, er->pkt_len);
+                } else {
+                    er->pkt_len = 0;
+                }
+
+                row_idx++;
+            }
+
+            p = eol;
+            if (*p == '\r') p++;
+            if (*p == '\n') p++;
+        }
+    }
+
+    /* ── Create UDP socket ── */
+    int sockfd = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    if (sockfd < 0) {
+        free(rows);
+        return -2;
+    }
+
+    /* Set up destination address */
+    struct sockaddr_in dest_addr;
+    memset(&dest_addr, 0, sizeof(dest_addr));
+    dest_addr.sin_family      = AF_INET;
+    dest_addr.sin_port        = htons((uint16_t)dest_port);
+
+    if (inet_pton(AF_INET, dest_ip, &dest_addr.sin_addr) != 1) {
+        close(sockfd);
+        free(rows);
+        return -2;
+    }
+
+    /* ── Transmission loop ── */
+    int ret        = 0;   /* return code */
+    int enc_errors = 0;   /* count of encoding errors encountered */
+
+    do {
+        int i = 0;
+
+        while (i < total_rows) {
+            /* Check stop flag before each frame group */
+            if (stop_flag && *stop_flag) goto cleanup;
+
+            long long current_frame = rows[i].frame_num;
+
+            /*
+             * Transmit all rows belonging to the current frame number.
+             * Rows are stored in CSV order, so consecutive rows with the
+             * same frame_num form one burst.
+             */
+            while (i < total_rows && rows[i].frame_num == current_frame) {
+                EncodedRow *er = &rows[i];
+
+                if (er->enc_error == 0 && er->pkt_len > 0) {
+                    ssize_t sent = sendto(sockfd,
+                                          er->pkt_buf,
+                                          (size_t)er->pkt_len,
+                                          0,
+                                          (struct sockaddr *)&dest_addr,
+                                          sizeof(dest_addr));
+                    if (sent < 0) {
+                        /* Transient send error: log but continue */
+                        /* (In SIL-4 production, this would raise a safety alarm.) */
+                        fprintf(stderr,
+                                "[svk_sim] sendto failed: frame=%lld "
+                                "tdma=%lld pkt_type=%d err=%s\n",
+                                er->frame_num, er->tdma_slot,
+                                er->pkt_type, strerror(errno));
+                    }
+                } else if (er->enc_error == -1) {
+                    enc_errors++;
+                }
+                /* enc_error == -2 (unsupported type): silently skip */
+
+                i++;
+            }
+
+            /*
+             * All packets for 'current_frame' have been sent.
+             * Sleep until the next 2-second wall-clock boundary before
+             * processing the next frame group.
+             *
+             * We check stop_flag once more after waking in case an abort
+             * was requested during the sleep.
+             */
+            if (i < total_rows) {
+                sleep_until_next_2s_boundary();
+                if (stop_flag && *stop_flag) goto cleanup;
+            }
+        }
+
+    } while (loop && !(stop_flag && *stop_flag));
+
+cleanup:
+    close(sockfd);
+    free(rows);
+
+    if (enc_errors > 0) ret = -3;
+    return ret;
+}
+
+/* ============================================================================
+ * SECTION 11 – SELF-TEST  (compile with -DSVK_TEST_MAIN)
+ * ============================================================================ */
+
+#ifdef SVK_TEST_MAIN
+
+static const char *SAMPLE_CSV =
+    "#,TimeLost Interval,,2\n"
+    "#TDMASlot,pktType,pktLen,frameNum,srcStationId,srcStationVer,locoId,"
+    "refProfileNum,lastRefRfid,distPktStart,pktDir,subPktType,subPktLen,"
+    "frameOffset,sos,secType,curSigInfo,curSigAsp,nxtSigAsp,apprSigDist,"
+    "authType,authSpeed,MA,shortMA,revMA,TLsts,TLtype,refFN,refOff,"
+    "nxtStnHO,nxtStationId,profileID,TLIProfID,CBCMAC,CRC\n"
+    "#\n"
+    "10,9,0,1,431,2,504,1,352,-300,1,0,0,0,0,1,8224,10,2,1200,1,100,3249,0,0,0,0,0,0,1,431,1,1,0,0\n"
+    "12,9,0,3,431,2,505,1,352,-300,1,0,0,0,0,1,8224,10,2,1200,1,100,3249,0,0,0,0,0,0,1,431,1,1,0,0\n"
+    "14,9,0,3,431,2,504,1,352,-300,1,0,0,0,0,1,8224,10,2,1200,1,100,3249,0,0,0,0,0,0,1,431,0,0,0,0\n";
+
+int main(void)
+{
+    printf("=== SVK SIM encode_storyboard_csv() self-test ===\n\n");
+
+    char json_out[65536];
+    int rc = encode_storyboard_csv(SAMPLE_CSV, json_out, sizeof(json_out));
+
+    if (rc != 0) {
+        fprintf(stderr, "encode_storyboard_csv() returned %d\n", rc);
+        return 1;
+    }
+
+    /* Pretty-print: show first 1024 chars */
+    printf("Output JSON (first 1024 chars):\n%.1024s\n...\n", json_out);
+    printf("\nTest PASSED (encode returned 0).\n");
+
+    printf("\n=== Transmission test (localhost:12345, no-loop) ===\n");
+    printf("(packets will be sent to 127.0.0.1:12345 – use netcat to observe)\n");
+
+    volatile int stop = 0;
+    rc = transmit_storyboard_csv(SAMPLE_CSV, "127.0.0.1", 12345, 0, &stop);
+    printf("transmit_storyboard_csv() returned %d\n", rc);
+
+    return (rc == 0) ? 0 : 1;
+}
+
+#endif /* SVK_TEST_MAIN */

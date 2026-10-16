@@ -1,0 +1,574 @@
+--- a/backend/svk_sim.c
++++ b/backend/svk_sim.c
+@@ -1798,11 +1798,345 @@
+     return real_len;
+ }
+ 
++/* ----------------------------------------------------------------------------
++ * PROFILE AMALGAMATION (route extension — ROUTE1..ROUTE4)
++ *
++ * When a route is extended, the MA and profiles sent to the Loco commence at
++ * the foot of the signal to the rear of the LRT (DIST_PKT_START is then a
++ * NEGATIVE value — see encode_pkt9()), and the profiles of the currently
++ * occupied section and of the newly extended route(s) are amalgamated into
++ * ONE sub-packet per type. Sending the same SUB_PKT_TYPE twice is not valid
++ * (decoder.py's decode_station_to_onboard() stops at the first repeated type).
++ *
++ * ROUTE1..ROUTE4 are taken in that order (ROUTE1 = the currently occupied
++ * section, nearest the loco). For each sub-packet type:
++ *   - exactly one route has it  → its bytes are copied verbatim (identical
++ *                                 to the old single-route behaviour), except
++ *                                 LC/Turnout/TCD of a later route, whose
++ *                                 distances are still shifted (see below);
++ *   - two or more routes have it → amalgamated (Annexure-C Amdt-10, C.4.2):
++ *
++ *   SSP / Gradient : LM_*_Distance is the length of each LM segment, so the
++ *       LMs of each profile are combined in route order and the LM count
++ *       aggregated. (Verified on the SKP APD sheet: SSP S.No 1+2+3 =
++ *       1202+1018+1010 = 3230 = S.No 9's span.)
++ *   LC Gate / Turnout / Track Condition : entries combined and count
++ *       aggregated, but their distance is measured FROM THE REFERENCE
++ *       position (LM_LC_Distance, DIFF_DIST_TO, START_DIST_TRACKCOND), so
++ *       every entry of route k is shifted by the span of routes 1..k-1.
++ *       A route's span = sum of its SSP LM distances (= the APD "Profile
++ *       Span"), or of its Gradient LM distances when it has no SSP.
++ *       Turnout: DIFF_DIST_TO / TO_SPEED_REL_DIST are only present when
++ *       TO_SPEED is restricted (!= 11111).
++ *   TLI : DIST_NXT_RFID is "from previous RFID", so the tag lists are joined;
++ *       a tag common to two consecutive TLIs is listed only once with the
++ *       inter-tag distances aggregated (one of them is 0). (Verified: TLI of
++ *       S.No 1+2+3 amalgamates byte-for-byte to S.No 9's TLI.)
++ *       DIST_DUP_TAG       — from the first TLI (common for a yard).
++ *       ABS_LOC_RESET      — the first TLI that has one ("in given MA,
++ *                            single location reset is considered").
++ *       ADJ_LINE_CNT/TINs  — "adjacent line TINs along the MA": the TINs of
++ *                            all TLIs, in order, duplicates removed (max 6,
++ *                            ADJ_LINE_CNT = TINs - 1). If the first TLI's
++ *                            ADJ_LINE_CNT is 6/7 (reserved/unknown, no TINs)
++ *                            it is kept as-is.
++ *
++ * The merged sub-packet is re-padded to a byte boundary and SUB_PKT_LENGTH
++ * recomputed. If a count field or the 128-byte sub-packet limit would
++ * overflow, the remaining entries are dropped and a warning goes to stderr —
++ * the packet is never corrupted.
++ * ---------------------------------------------------------------------------- */
++
++#define TP_SUBPKT_MAX_BYTES 128   /* 7-bit SUB_PKT_LENGTH → (127 + 1) bytes */
++
++/** MSB-first bit reader over a decoded sub-packet field (reads 0 past end). */
++typedef struct {
++    const uint8_t *b;
++    int            nbits;
++    int            pos;
++} TpReader;
++
++static uint32_t tp_read(TpReader *rd, int n)
++{
++    uint32_t v = 0;
++    for (int i = 0; i < n; i++) {
++        int p   = rd->pos++;
++        int bit = (p < rd->nbits) ? ((rd->b[p / 8] >> (7 - (p % 8))) & 1) : 0;
++        v = (v << 1) | (uint32_t)bit;
++    }
++    return v;
++}
++
++/** Overwrite @nbits at a previously reserved @bit_pos (generalised bw_backfill_7bit). */
++static void bw_backfill_bits(BitWriter *bw, int bit_pos, uint32_t val, int nbits)
++{
++    for (int i = 0; i < nbits; i++) {
++        int bpos   = bit_pos + i;
++        int byte_i = bpos / 8;
++        int bit_i  = 7 - (bpos % 8);
++        if ((val >> (nbits - 1 - i)) & 1u)
++            bw->buf[byte_i] |=  (uint8_t)(1u << bit_i);
++        else
++            bw->buf[byte_i] &= ~(uint8_t)(1u << bit_i);
++    }
++}
++
++/** Pad @bw to a byte boundary and back-fill SUB_PKT_LENGTH (at bit 4). */
++static int tp_finish_subpkt(BitWriter *bw, uint8_t *out, int max_out)
++{
++    int nbytes = bw_byte_len(bw);
++    if (nbytes > TP_SUBPKT_MAX_BYTES || nbytes > max_out) return 0;
++    bw_backfill_7bit(bw, 4, (uint8_t)(nbytes - 1));
++    memcpy(out, bw->buf, nbytes);
++    return nbytes;
++}
++
++/* One LM / entry of a list-type sub-packet, as up to 3 fields:
++ * f[0..nf-1] with widths w[]; dist_idx = index of the distance field that is
++ * measured from the reference position (-1 = segment length, never shifted). */
++typedef struct {
++    uint32_t f[6];
++    int      w[6];
++    int      nf;
++    int      dist_idx;
++} TpEntry;
++
++static int tp_count_width(int sp_type)
++{
++    switch (sp_type) {
++    case 0x1: case 0x2: case 0x3: return 5;   /* LM_*_Info_CNT    */
++    case 0x4: return 2;                       /* TO_CNT           */
++    case 0x6: return 4;                       /* TRACKCOND_CNT    */
++    default:  return 0;
++    }
++}
++
++/** Read one entry of @sp_type from @rd (C.4.2 field layouts). */
++static void tp_read_entry(int sp_type, TpReader *rd, TpEntry *e)
++{
++    memset(e, 0, sizeof(*e));
++    e->dist_idx = -1;
++#define TP_F(width) do { e->w[e->nf] = (width); e->f[e->nf] = tp_read(rd, (width)); e->nf++; } while (0)
++    switch (sp_type) {
++    case 0x1:                                 /* Static Speed Profile                 */
++        TP_F(15);                             /* LM_Static_Speed_Distance (segment)   */
++        TP_F(1);                              /* LM_Static_Speed_Class                */
++        if (e->f[1]) TP_F(18);                /* Class A,B,C speeds (3 x 6)           */
++        else         TP_F(6);                 /* Universal speed                      */
++        break;
++    case 0x2:                                 /* Gradient                             */
++        TP_F(15); TP_F(1); TP_F(5);           /* Distance (segment), GDIR, VALUE      */
++        break;
++    case 0x3:                                 /* LC Gate                              */
++        TP_F(15); e->dist_idx = 0;            /* LM_LC_Distance (from reference)      */
++        TP_F(10); TP_F(3); TP_F(1); TP_F(3); TP_F(3); /* ID, suffix, manning, class,
++                                                 auto-whistling enabled(1)+type(2)    */
++        break;
++    case 0x4:                                 /* Turnout                              */
++        TP_F(5);                              /* TO_SPEED                             */
++        if (e->f[0] != 0x1F) {                /* only if restricted                   */
++            TP_F(15); e->dist_idx = 1;        /* DIFF_DIST_TO (from reference RFID)   */
++            TP_F(12);                         /* TO_SPEED_REL_DIST                    */
++        }
++        break;
++    case 0x6:                                 /* Track Condition                      */
++        TP_F(4);                              /* TRACKCOND_TYPE                       */
++        TP_F(15); e->dist_idx = 1;            /* START_DIST_TRACKCOND (from ref RFID) */
++        TP_F(15);                             /* LENGTH_TRACKCOND                     */
++        break;
++    }
++#undef TP_F
++}
++
++static int tp_entry_bits(const TpEntry *e)
++{
++    int n = 0;
++    for (int i = 0; i < e->nf; i++) n += e->w[i];
++    return n;
++}
++
++/** Span (m) of a profile = sum of its SSP (or Gradient) LM segment lengths. */
++static uint32_t tp_profile_span(const uint8_t *sub, int len)
++{
++    if (len <= 0) return 0;
++    int sp_type = sub[0] >> 4;
++    TpReader rd = { sub, len * 8, 11 };
++    int cnt = (int)tp_read(&rd, tp_count_width(sp_type));
++    uint32_t span = 0;
++    for (int i = 0; i < cnt && rd.pos < rd.nbits; i++) {
++        TpEntry e;
++        tp_read_entry(sp_type, &rd, &e);
++        span += e.f[0];
++    }
++    return span;
++}
++
++/**
++ * tp_merge_list_subpkts() – amalgamate @nsrc list-type sub-packets of the
++ * same type: entries combined in route order, count aggregated, and (for
++ * LC / Turnout / Track Condition) each entry's from-reference distance
++ * shifted by @offset[s] (span of the routes before it). Returns bytes written.
++ */
++static int tp_merge_list_subpkts(int sp_type,
++                                 const uint8_t *src[], const int src_len[],
++                                 const uint32_t offset[], int nsrc,
++                                 uint8_t *out, int max_out)
++{
++    int cw        = tp_count_width(sp_type);
++    int max_count = (1 << cw) - 1;
++    int max_bits  = TP_SUBPKT_MAX_BYTES * 8;
++
++    BitWriter bw;
++    bw_init(&bw);
++    bw_write(&bw, (uint64_t)sp_type, 4);      /* SUB_PKT_TYPE              */
++    bw_write(&bw, 0, 7);                      /* SUB_PKT_LENGTH (backfill) */
++    int cnt_pos = bw.bit_pos;
++    bw_write(&bw, 0, cw);                     /* count (backfill)          */
++
++    int total = 0, dropped = 0;
++    for (int s = 0; s < nsrc; s++) {
++        TpReader rd = { src[s], src_len[s] * 8, 11 };
++        int cnt = (int)tp_read(&rd, cw);
++        for (int i = 0; i < cnt; i++) {
++            TpEntry e;
++            tp_read_entry(sp_type, &rd, &e);
++            if (rd.pos > rd.nbits) break;     /* malformed / truncated     */
++
++            if (e.dist_idx >= 0) {
++                uint32_t d = e.f[e.dist_idx] + offset[s];
++                if (d > 32767u) {
++                    fprintf(stderr, "[PROFILE_MERGE] SUB_PKT_TYPE %d: distance %u m "
++                                    "clamped to 32767\n", sp_type, d);
++                    d = 32767u;
++                }
++                e.f[e.dist_idx] = d;
++            }
++            if (total >= max_count || bw.bit_pos + tp_entry_bits(&e) > max_bits - 7) {
++                dropped++;                    /* -7: room for byte padding */
++                continue;
++            }
++            for (int k = 0; k < e.nf; k++)
++                bw_write(&bw, e.f[k], e.w[k]);
++            total++;
++        }
++    }
++    if (dropped)
++        fprintf(stderr, "[PROFILE_MERGE] SUB_PKT_TYPE %d: %d entr%s dropped "
++                        "(count/length limit reached)\n",
++                sp_type, dropped, dropped == 1 ? "y" : "ies");
++
++    bw_backfill_bits(&bw, cnt_pos, (uint32_t)total, cw);
++    return tp_finish_subpkt(&bw, out, max_out);
++}
++
++/**
++ * tp_merge_tli_subpkts() – amalgamate @nsrc Tag Linking Information
++ * sub-packets (see the section comment above for the rules). Returns bytes
++ * written.
++ */
++static int tp_merge_tli_subpkts(const uint8_t *src[], const int src_len[], int nsrc,
++                                uint8_t *out, int max_out)
++{
++    enum { TLI_MAX_TAGS = 62, TLI_MAX_TINS = 6 };
++    uint32_t dist[TLI_MAX_TAGS], tag[TLI_MAX_TAGS], dir[TLI_MAX_TAGS];
++    int      ntags = 0, dropped = 0;
++
++    uint32_t dist_dup = 0;
++    uint32_t alr = 0, alr_start = 0, alr_dir = 0, alr_loc = 0;
++    uint32_t first_adj = 0, tins[TLI_MAX_TINS];
++    int      ntins = 0;
++
++    for (int s = 0; s < nsrc; s++) {
++        TpReader rd = { src[s], src_len[s] * 8, 11 };
++        uint32_t dd  = tp_read(&rd, 4);       /* DIST_DUP_TAG              */
++        int      cnt = (int)tp_read(&rd, 6);  /* ROUTE_RFID_CNT            */
++        if (s == 0) dist_dup = dd;
++        if (cnt > TLI_MAX_TAGS) cnt = 0;      /* 63 = reserved             */
++
++        for (int i = 0; i < cnt; i++) {
++            uint32_t d = tp_read(&rd, 11);    /* DIST_NXT_RFID             */
++            uint32_t t = tp_read(&rd, 10);    /* NXT_RFID_TAG_ID           */
++            uint32_t r = tp_read(&rd, 1);     /* DUP_TAG_DIR               */
++
++            /* Tag common to two consecutive TLIs → list it once, aggregate
++             * the inter-tag distances (one of them is 0). */
++            if (i == 0 && ntags > 0 && tag[ntags - 1] == t) {
++                uint32_t sum = dist[ntags - 1] + d;
++                dist[ntags - 1] = (sum > 2047u) ? 2047u : sum;
++                continue;
++            }
++            if (ntags >= TLI_MAX_TAGS) { dropped++; continue; }
++            dist[ntags] = d; tag[ntags] = t; dir[ntags] = r;
++            ntags++;
++        }
++
++        uint32_t a = tp_read(&rd, 1);         /* ABS_LOC_RESET             */
++        uint32_t a_start = 0, a_dir = 0, a_loc = 0;
++        if (a) {
++            a_start = tp_read(&rd, 15);       /* START_DIST_TO_LOC_RESET   */
++            a_dir   = tp_read(&rd, 2);        /* ADJ_LOCO_DIR              */
++            a_loc   = tp_read(&rd, 23);       /* ABS_LOC_CORRECTION        */
++        }
++        if (a && !alr) {                      /* single location reset per MA */
++            alr = 1; alr_start = a_start; alr_dir = a_dir; alr_loc = a_loc;
++        }
++
++        uint32_t adj = tp_read(&rd, 3);       /* ADJ_LINE_CNT              */
++        if (s == 0) first_adj = adj;
++        if (adj <= 5) {                       /* LINE_TIN only for 0..5    */
++            for (uint32_t j = 0; j <= adj; j++) {
++                uint32_t tin = tp_read(&rd, 9);
++                int seen = 0;
++                for (int k = 0; k < ntins; k++) if (tins[k] == tin) seen = 1;
++                if (seen) continue;
++                if (ntins < TLI_MAX_TINS) tins[ntins++] = tin;
++                else fprintf(stderr, "[PROFILE_MERGE] TLI: TIN %u dropped "
++                                     "(max %d)\n", tin, TLI_MAX_TINS);
++            }
++        }
++    }
++    if (dropped)
++        fprintf(stderr, "[PROFILE_MERGE] TLI: %d tag(s) dropped "
++                        "(ROUTE_RFID_CNT limit %d reached)\n", dropped, TLI_MAX_TAGS);
++
++    BitWriter bw;
++    bw_init(&bw);
++    bw_write(&bw, 0x5, 4);                    /* SUB_PKT_TYPE = TLI        */
++    bw_write(&bw, 0, 7);                      /* SUB_PKT_LENGTH (backfill) */
++    bw_write(&bw, dist_dup, 4);
++    bw_write(&bw, (uint64_t)ntags, 6);
++    for (int i = 0; i < ntags; i++) {
++        bw_write(&bw, dist[i], 11);
++        bw_write(&bw, tag[i],  10);
++        bw_write(&bw, dir[i],   1);
++    }
++    bw_write(&bw, alr, 1);
++    if (alr) {
++        bw_write(&bw, alr_start, 15);
++        bw_write(&bw, alr_dir,    2);
++        bw_write(&bw, alr_loc,   23);
++    }
++    if (first_adj > 5 || ntins == 0) {
++        bw_write(&bw, first_adj, 3);          /* reserved/unknown — no TINs */
++    } else {
++        bw_write(&bw, (uint64_t)(ntins - 1), 3);
++        for (int j = 0; j < ntins; j++)
++            bw_write(&bw, tins[j], 9);
++    }
++
++    int n = tp_finish_subpkt(&bw, out, max_out);
++    if (n == 0)
++        fprintf(stderr, "[PROFILE_MERGE] TLI: amalgamated sub-packet exceeds "
++                        "%d bytes — ROUTE1's TLI sent instead\n", TP_SUBPKT_MAX_BYTES);
++    return n;
++}
++
+ /**
+  * track_profile_append_route_subpackets() – for a storyboard row's
+  * ROUTE1..ROUTE4 (r->route[0..3]), look up each referenced Track Profile
+- * S.No and append the real (non-placeholder) bytes of its PSR / Gradient /
+- * LC / Turnout / TLI / TCD sub-packet fields into @out, in that order.
++ * S.No and append ONE sub-packet per type (PSR / Gradient / LC / Turnout /
++ * TLI / TCD, in that order) into @out — amalgamating across routes when more
++ * than one route carries the same type (see PROFILE AMALGAMATION above).
+  *
+  * A route value of 0, or a route S.No that isn't in the loaded table, is
+  * silently skipped (no Track Profile loaded yet, or that row's route
+@@ -1813,7 +2147,11 @@
+  */
+ static int track_profile_append_route_subpackets(const CsvRow *r, uint8_t *out, int max_out)
+ {
+-    int total = 0;
++    /* Decoded sub-packets per resolved route: raw[route][field] */
++    uint8_t  raw[4][6][TRACK_PROFILE_SUBPKT_MAX];
++    int      raw_len[4][6];
++    uint32_t span[4];
++    int      nroutes = 0;
+ 
+     for (int ridx = 0; ridx < 4; ridx++) {
+         long long sno = r->route[ridx];
+@@ -1825,14 +2163,55 @@
+         const char *fields[6] = { tp->psr, tp->gradient, tp->lc, tp->turnout, tp->tli, tp->tcd };
+ 
+         for (int f = 0; f < 6; f++) {
+-            uint8_t raw[TRACK_PROFILE_SUBPKT_MAX];
+-            int n = track_profile_hex_to_bytes(fields[f], raw, sizeof(raw));
+-            int real_len = track_profile_real_len(raw, n);
+-            if (real_len <= 0) continue;
+-            if (total + real_len > max_out) return total;   /* safety guard */
+-            memcpy(out + total, raw, real_len);
+-            total += real_len;
++            int n = track_profile_hex_to_bytes(fields[f], raw[nroutes][f], TRACK_PROFILE_SUBPKT_MAX);
++            raw_len[nroutes][f] = track_profile_real_len(raw[nroutes][f], n);
+         }
++        span[nroutes] = raw_len[nroutes][0] > 0
++                      ? tp_profile_span(raw[nroutes][0], raw_len[nroutes][0])   /* SSP      */
++                      : tp_profile_span(raw[nroutes][1], raw_len[nroutes][1]);  /* Gradient */
++        nroutes++;
++    }
++
++    int total = 0;
++    for (int f = 0; f < 6; f++) {
++        const uint8_t *srcs[4];
++        int            lens[4];
++        uint32_t       offs[4];
++        int            nsrc = 0;
++        uint32_t       cum  = 0;          /* span of the routes before this one */
++
++        for (int k = 0; k < nroutes; k++) {
++            if (raw_len[k][f] > 0) {
++                srcs[nsrc] = raw[k][f];
++                lens[nsrc] = raw_len[k][f];
++                offs[nsrc] = cum;
++                nsrc++;
++            }
++            cum += span[k];
++        }
++        if (nsrc == 0) continue;
++
++        uint8_t        merged[TP_SUBPKT_MAX_BYTES];
++        const uint8_t *src = srcs[0];
++        int            len = lens[0];
++
++        /* Merge when several routes carry this type — or when only a later
++         * route does, so its from-reference distances still get shifted. */
++        int sp_type = srcs[0][0] >> 4;
++        int needs_shift = (offs[0] != 0) && (sp_type == 0x3 || sp_type == 0x4 || sp_type == 0x6);
++        if (nsrc > 1 || needs_shift) {
++            int n = (sp_type == 0x5)
++                  ? tp_merge_tli_subpkts(srcs, lens, nsrc, merged, sizeof(merged))
++                  : (tp_count_width(sp_type) > 0)
++                      ? tp_merge_list_subpkts(sp_type, srcs, lens, offs, nsrc, merged, sizeof(merged))
++                      : 0;
++            if (n > 0) { src = merged; len = n; }
++            /* else: unknown type / overflow — fall back to the first route's own sub-packet */
++        }
++
++        if (total + len > max_out) return total;   /* safety guard */
++        memcpy(out + total, src, len);
++        total += len;
+     }
+ 
+     return total;
+@@ -2081,7 +2460,15 @@
+      * (r->route[0..3], from the dedicated wide route columns raw[31..34]) —
+      * an internal-use S.No index into the loaded Track Profile table, which
+      * can exceed 15. So gate on the route columns alone; refProfNum must
+-     * not influence this. */
++     * not influence this.
++     *
++     * ROUTE EXTENSION: with more than one route set, the profiles are
++     * amalgamated into one sub-packet per type (SSP LMs combined + count
++     * aggregated, TLIs joined at their common tag) — see PROFILE
++     * AMALGAMATION in SECTION 5B. The reference location is then the foot
++     * of the signal to the rear of the LRT, so DIST_PKT_START (v[9], from
++     * the MA table's distPktStart column) is negative; it is written below
++     * as 15-bit two's complement by bw_write_signed(). */
+     uint8_t profile_bytes[TRACK_PROFILE_SUBPKT_MAX * 6 * 4];
+     int profile_byte_count = 0;
+     int any_route_set = (r->route[0] != 0) || (r->route[1] != 0) ||
+--- a/backend/main.py
++++ b/backend/main.py
+@@ -1974,8 +1974,28 @@
+                                                   # matching Track Profile (APD) row for the profile
+                                                   # sub-packets (8-bit: 0-255). NOT written into the
+                                                   # REF_PROF_ID header field.
++    "ROUTE2":        ("route2",           8),   # ROUTE2..ROUTE4 — same as ROUTE1. When a route is
++    "ROUTE3":        ("route3",           8),   # extended, list the currently occupied section's
++    "ROUTE4":        ("route4",           8),   # profile in ROUTE1 and the extended route(s) in
++                                                  # ROUTE2..ROUTE4, in running order; svk_sim.c then
++                                                  # amalgamates them into ONE sub-packet per type
++                                                  # (SSP LMs combined, TLIs joined at the common tag).
++                                                  # 0 / blank = no profile in that slot.
+ }
+ 
++# Every MA-table field key that selects Track Profile (APD) rows.
++_MA_ROUTE_KEYS = ("route1", "route2", "route3", "route4")
++
++# Signed MA-table fields: {field_key: (min, max)}. DIST_PKT_START is negative
++# when the route is extended (reference location = foot of the signal to the
++# rear of the LRT); every other field is unsigned 0..(2^width - 1).
++_MA_SIGNED_RANGES = {"dist_pkt_start": (-16384, 16383)}
++
++
++def _ma_value_in_range(field_key: str, width: int, v: int) -> bool:
++    lo, hi = _MA_SIGNED_RANGES.get(field_key, (0, (1 << width) - 1))
++    return lo <= v <= hi
++
+ _ma_table: dict = {}                                    # {rfid_tag: {field_key: value, ...}}
+ _ma_table_meta: dict = {"filename": None, "row_count": 0, "columns_found": []}
+ _live_ma: dict = {"rfid_tag": None, "fields": {}, "updated_at": None}
+@@ -2163,7 +2183,11 @@
+                                 ma_val = int(ma_fields[field_key])
+ 
+                                 # Validate the value fits in the field width
+-                                if 0 <= ma_val <= ((1 << width) - 1):
++                                # (DIST_PKT_START may be negative — see
++                                # _MA_SIGNED_RANGES; it is written into the CSV
++                                # as a plain signed decimal, which svk_sim.c's
++                                # encode_pkt9() encodes as 15-bit 2's complement)
++                                if _ma_value_in_range(field_key, width, ma_val):
+                                     # Ensure we have enough fields
+                                     while len(fields) <= csv_idx:
+                                         fields.append('0')
+@@ -2288,7 +2312,7 @@
+                 if field_key in live_ma_fields:
+                     ma_val = int(live_ma_fields[field_key])
+ 
+-                    if 0 <= ma_val <= ((1 << width) - 1):
++                    if _ma_value_in_range(field_key, width, ma_val):
+                         while len(fields) <= csv_idx:
+                             fields.append('0')
+ 
+@@ -2379,21 +2403,11 @@
+                 v = int(cell)
+             except (TypeError, ValueError):
+                 continue
+-            # distPktStart (15 bits) can hold values 0-32767
+-            # For negative values, they are stored as two's complement unsigned equivalents
+-            # (e.g., -1 becomes 32767, -2 becomes 32766, etc.)
+-            # Range: -16384 to 16383 (standard 15-bit signed)
+-            # or 0 to 32767 (unsigned representation)
+-            if field_key == "dist_pkt_start":
+-                # Accept both positive and negative values: -16384 to 16383
+-                min_val = -16384
+-                max_val = 16383
+-                if not (min_val <= v <= max_val):
+-                    continue
+-            else:
+-                # All other fields are unsigned: 0 to (2^width - 1)
+-                if not (0 <= v <= (1 << width) - 1):
+-                    continue
++            # distPktStart is 15-bit signed (-16384..16383) — negative when
++            # the route is extended (see _MA_SIGNED_RANGES); every other
++            # field is unsigned 0..(2^width - 1).
++            if not _ma_value_in_range(field_key, width, v):
++                continue
+             row_fields[field_key] = v
+ 
+         if "ma_m" not in row_fields:
+@@ -3396,7 +3410,8 @@
+                                 should_stop=lambda: _serial_tx_stop))
+ 
+             # ═══════════════════════════════════════════════════════════════════════════
+-            # ROUTE1 RE-ENCODING CACHE: Store re-encoded packets when route1 changes
++            # ROUTE1 RE-ENCODING CACHE: Store re-encoded packets when route1..route4 change
++            # (_prev_route1 holds the (route1, route2, route3, route4) tuple)
+             # ═══════════════════════════════════════════════════════════════════════════
+             _prev_route1 = None
+             _original_payload_csv = payload.csv
+@@ -3462,10 +3477,16 @@
+                         break
+                     csv_frame_num, pkts = story["frames"][frame_idx]
+ 
+-                    # Check if route1 changed and re-encode if needed
+-                    current_route1 = _live_ma.get("fields", {}).get("route1")
++                    # Check if ANY of route1..route4 changed and re-encode if
++                    # needed — a route extension can keep route1 the same and
++                    # only add/change route2..route4 (amalgamated profiles).
++                    _live_fields = _live_ma.get("fields", {})
++                    current_route1 = (
++                        tuple(_live_fields.get(k, 0) for k in _MA_ROUTE_KEYS)
++                        if any(k in _live_fields for k in _MA_ROUTE_KEYS) else None
++                    )
+                     if current_route1 is not None and current_route1 != _prev_route1:
+-                        print(f"[ROUTE1_REENC] Detected: {_prev_route1} → {current_route1}, re-encoding...", file=sys.stderr)
++                        print(f"[ROUTE1_REENC] Detected routes: {_prev_route1} → {current_route1}, re-encoding...", file=sys.stderr)
+                         try:
+                             # Apply LIVE MA values to all CSV rows (not trying to match RFIDs)
+                             live_ma_fields = _live_ma.get("fields", {})
+@@ -3479,7 +3500,7 @@
+                                     pkt_key = (new_pkt["frame_num"], new_pkt["tdma_slot"])
+                                     _reencoded_cache[pkt_key] = new_pkt
+ 
+-                            print(f"[ROUTE1_REENC] ✅ Cached {len(_reencoded_cache)} re-encoded packets for route1={current_route1}", file=sys.stderr)
++                            print(f"[ROUTE1_REENC] ✅ Cached {len(_reencoded_cache)} re-encoded packets for routes={current_route1}", file=sys.stderr)
+                         except Exception as e:
+                             print(f"[ROUTE1_REENC] ❌ Failed: {e}", file=sys.stderr)
+ 
+--- a/frontend/src/SvkSim.jsx
++++ b/frontend/src/SvkSim.jsx
+@@ -1985,6 +1985,9 @@
+     "next_sig_aspect": "NXT_SIG_ASP",
+     "appr_sig_dist": "APPR_SIG_DIST",
+     "route1": "ROUTE1",
++    "route2": "ROUTE2",
++    "route3": "ROUTE3",
++    "route4": "ROUTE4",
+   };
+ 
+   // "last_rfid_tag" is filtered out here — it's the MA table's matching key,

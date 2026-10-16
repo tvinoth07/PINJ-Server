@@ -1,0 +1,9 @@
+{
+"files.exclude": {
+    "**/.svn": true,
+    "**/.git": true,
+    "**/.DS_Store": true,
+    "**/Thumbs.db": true,
+    "**/*.Zone.Identifier": true
+}
+}

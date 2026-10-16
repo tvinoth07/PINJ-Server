@@ -1,0 +1,6 @@
+fastapi>=0.118
+uvicorn[standard]>=0.35
+pydantic>=2.11
+python-multipart
+pyserial==3.5
+openpyxl

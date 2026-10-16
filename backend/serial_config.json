@@ -1,0 +1,13 @@
+{
+  "mode": "decode_live",
+  "tty_device": "/dev/ttyUSB0",
+  "baud_rate": 57600,
+  "read_timeout_s": 0.25,
+  "write_timeout_s": 1.0,
+  "data_bits": 8,
+  "stop_bits": 1.0,
+  "parity": "N",
+  "tx_mode": "DOX",
+  "dox_delay": 6,
+  "rts_control_enabled": 1
+}
