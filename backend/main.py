@@ -1970,6 +1970,8 @@ _MA_XLSX_COLUMN_MAP = {
                                                   # header (0000 = no profile, 0001-1111 = valid profile).
                                                   # Comes ONLY from the MA table's "REF_PROF_ID" column
                                                   # (normalised REFPROFID). Never derived from route1.
+    "REFPROFILENUM": ("REF_PROF_ID",      4),   # same field — accepted alias, so MA sheets whose
+                                                  # column is still called "refProfileNum" load too
     "ROUTE1":        ("route1",           8),   # ROUTE1 — INTERNAL use only: S.No used to fetch the
                                                   # matching Track Profile (APD) row for the profile
                                                   # sub-packets (8-bit: 0-255). NOT written into the
@@ -2419,10 +2421,12 @@ def _build_ma_table(xlsx_bytes: bytes) -> tuple:
         table[tag] = row_fields
         row_count += 1
 
-    columns_found = [
+    # dict.fromkeys(): one entry per field even when two header names map to
+    # it (REF_PROF_ID / refProfileNum), in _MA_XLSX_COLUMN_MAP order.
+    columns_found = list(dict.fromkeys(
         field_key for field_key, _w in _MA_XLSX_COLUMN_MAP.values()
         if field_key in col_idx_by_field
-    ]
+    ))
     return table, row_count, skipped, columns_found
 
 

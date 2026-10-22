@@ -27,7 +27,7 @@ export const DMI_COL = {          // Table B.2
 };
 const FONT = "Helvetica, Arial, 'Microsoft Sans Serif', sans-serif";
 
-const MODES = {                    // LOCO_MODE (Annexure-C) → Annexure-B symbol + full text
+export const MODES = {                    // LOCO_MODE (Annexure-C) → Annexure-B symbol + full text
   1:  { key: "SB", text: "Stand By Mode" },
   2:  { key: "SR", text: "Staff Responsible Mode" },
   3:  { key: "LS", text: "Limited Supervision Mode" },
@@ -44,11 +44,11 @@ const MODES = {                    // LOCO_MODE (Annexure-C) → Annexure-B symb
 };
 
 /* D3 — line (a8…a5) and signal type (a14…a9) abbreviations, Annexure-B §B4.6.4.3 */
-const LINE_ABBR = {
+export const LINE_ABBR = {
   0b0000: "UP", 0b0001: "DN", 0b0010: "UP FAST", 0b0011: "DN FAST", 0b1000: "UP SLOW", 0b1001: "DN SLOW",
   0b1010: "UP MAIN", 0b1011: "DN MAIN", 0b1100: "UP SUB", 0b1101: "DN SUB", 0b1110: "UP BI-DIR", 0b1111: "DN BI-DIR",
 };
-const SIG_ABBR = {
+export const SIG_ABBR = {
   0b010000: "Dist", 0b010001: "Inr-Dist", 0b010010: "Gate-Dist", 0b010011: "Gate-Inr-Dist",
   0b010100: "IB-Dist", 0b010101: "IB-Inr-Dist", 0b010110: "Auto", 0b010111: "Semi-Auto",
   0b011000: "Home", 0b011001: "Home L-X", 0b011010: "R-Home", 0b011011: "R-Home L-X",
@@ -77,7 +77,7 @@ const ASPECT_LAMPS = {
   8: [0, 0, 1, 0], 9: [0, 0, 1, 0], 10: [1, 0, 1, 0], 11: [0, 1, 0, 0],
   14: [0, 0, 0, 1], 15: [0, 0, 0, 1], 48: [0, 0, 0, 1],
 };
-const ASPECT_NAME = { 1: "Red", 2: "Yellow", 3: "Yellow + Route 1", 4: "Yellow + Route 2", 5: "Yellow + Route 3", 6: "Yellow + Route 4",
+export const ASPECT_NAME = { 1: "Red", 2: "Yellow", 3: "Yellow + Route 1", 4: "Yellow + Route 2", 5: "Yellow + Route 3", 6: "Yellow + Route 4",
   7: "Yellow + Route 5", 8: "Yellow + Route 6", 9: "Yellow + Stencil Route", 10: "Double Yellow", 11: "Green", 14: "AG Marker OFF",
   15: "Red + Calling-On", 48: "Stop Board" };
 /* junction-type route indication: position 1…6 (aspect 3…8), "stencil" (aspect 9) */
