@@ -396,17 +396,19 @@ def decode_subpkt_movement_authority(reader):
                   3: "Yellow + Pos1 Junction Route Indication", 4: "Yellow + Pos2 Junction Route Indication",
                   5: "Yellow + Pos3 Junction Route Indication", 6: "Yellow + Pos4 Junction Route Indication",
                   7: "Yellow + Pos5 Junction Route Indication", 8: "Yellow + Pos6 Junction Route Indication",
-                  9: "Yellow + Stencil type Route Indication",
+                  9: "Yellow + Stencil type Route Indication (Amdt-9; Spare in Amdt-10)",
                   10: "Double Yellow", 11: "Green",
-                  14: "AG Marker OFF", 15: "Red+Calling-On", 48: "Stop Board/Buffer Stop"}
+                  14: "AG Marker OFF", 15: "Red+Calling-On", 24: "Stop Board/Buffer Stop"}
+    # Annexure-C Amdt-10: 100000…111111 (32…63) = Yellow with Stencil route 1…32
+    asp_desc = lambda v: aspect_map.get(v) or (f"Yellow + Stencil Route {v - 31}" if 32 <= v <= 63 else f"Aspect code {v}")
     b = reader.read(6)
     v = bits_to_int(b)
     rows.append(make_row("CUR_SIG_ASPECT", 6, b, v,
-                aspect_map.get(v, f"Aspect code {v}")))
+                asp_desc(v)))
     b = reader.read(6)
     v = bits_to_int(b)
     rows.append(make_row("NEXT_SIG_ASPECT", 6, b, v,
-                         "Undefined (current=RED)" if v == 0 else aspect_map.get(v, f"Aspect code {v}")))
+                         "Undefined (current=RED)" if v == 0 else asp_desc(v)))
     b = reader.read(15)
     v = bits_to_int(b)
     rows.append(make_row("APPR_SIG_DIST", 15, b, v,

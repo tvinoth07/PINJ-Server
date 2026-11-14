@@ -1,9 +1,11 @@
 import { useState, useRef, useEffect, useCallback, useMemo } from "react";
 
+import { API_BASE } from "./apiBase";
+import { UserChip } from "./Auth";
 import LogReplay from "./LogReplay";
 import DmiSim from "./DmiSim";
-const INGEST_URL = "http://localhost:8000/ingest";
-const HEALTH_URL = "http://localhost:8000/health";
+const INGEST_URL = API_BASE + "/ingest";
+const HEALTH_URL = API_BASE + "/health";
 
 /* ── Bit injection ── */
 function injectBits(hex, start, len, val) {
@@ -302,6 +304,29 @@ html,body,#root{height:100%;width:100%;background:var(--void);color:var(--tp);fo
 ::-webkit-scrollbar{width:4px;height:4px;}::-webkit-scrollbar-track{background:transparent;}
 ::-webkit-scrollbar-thumb{background:var(--bdr2);border-radius:2px;}::-webkit-scrollbar-thumb:hover{background:var(--amber);}
 button{cursor:pointer;font-family:var(--body);}button:disabled{cursor:not-allowed;opacity:.4;}
+/* NOVA company logo — same as the PINJ header (App.jsx .kv-nova-logo). The top bar is dark in both themes,
+   so the light-text wordmark (nova-text-dark.png) is always used. */
+.kv-nova-logo{display:flex;align-items:center;gap:10px;flex-shrink:0;height:52px;cursor:default;position:relative;}
+.kv-nova-logo-markwrap{position:relative;width:44px;height:44px;flex-shrink:0;}
+.kv-nova-logo-markwrap::before{content:'';position:absolute;inset:6px;border-radius:50%;pointer-events:none;
+  background:radial-gradient(circle,rgba(56,189,248,0.28),rgba(168,85,247,0.12) 55%,transparent 72%);animation:kv-nova-halo 4.2s ease-in-out infinite;}
+.kv-nova-logo-mark{position:relative;height:44px;width:44px;object-fit:contain;display:block;animation:kv-nova-breathe 4.2s ease-in-out infinite;transition:transform .35s cubic-bezier(0.22,1,0.36,1);}
+@keyframes kv-nova-breathe{0%,100%{filter:drop-shadow(0 0 5px rgba(56,189,248,0.40)) drop-shadow(0 0 1px rgba(56,189,248,0.6));}50%{filter:drop-shadow(0 0 11px rgba(168,85,247,0.55)) drop-shadow(0 0 3px rgba(56,189,248,0.7));}}
+@keyframes kv-nova-halo{0%,100%{opacity:.45;transform:scale(.92);}50%{opacity:.95;transform:scale(1.08);}}
+.kv-nova-logo-wordwrap{position:relative;display:block;height:26px;}
+.kv-nova-logo-word{height:26px;width:auto;object-fit:contain;display:block;filter:drop-shadow(0 0 4px rgba(226,232,240,0.18));transition:filter .35s;}
+.kv-nova-logo-shine{position:absolute;inset:0;pointer-events:none;
+  -webkit-mask:url(/nova-text-dark.png) center / 100% 100% no-repeat;mask:url(/nova-text-dark.png) center / 100% 100% no-repeat;
+  background:linear-gradient(105deg,transparent 0%,transparent 40%,rgba(125,211,252,0.95) 48%,#ffffff 50%,rgba(192,132,252,0.9) 53%,transparent 61%,transparent 100%);
+  background-size:300% 100%;background-repeat:no-repeat;animation:kv-nova-shine 5.5s ease-in-out infinite;}
+@keyframes kv-nova-shine{0%,55%{background-position:120% 0;}85%,100%{background-position:-20% 0;}}
+.kv-nova-logo:hover .kv-nova-logo-mark{transform:translateY(-1px) scale(1.05);}
+.kv-nova-logo:hover .kv-nova-logo-word{filter:drop-shadow(0 0 7px rgba(125,211,252,0.45));}
+.kv-nova-divider{width:1px;height:30px;flex-shrink:0;background:linear-gradient(180deg,transparent,rgba(56,189,248,0.45) 30%,rgba(168,85,247,0.35) 70%,transparent);}
+.kv-back{display:inline-flex;align-items:center;gap:6px;font-size:10px;font-weight:700;letter-spacing:.08em;color:#cbd5e1;font-family:var(--mono);text-decoration:none;
+  padding:5px 11px;border-radius:7px;border:1px solid rgba(56,189,248,0.35);background:rgba(56,189,248,0.08);flex-shrink:0;transition:all .15s;}
+.kv-back:hover{color:#fff;border-color:#38bdf8;background:rgba(56,189,248,0.18);box-shadow:0 0 12px rgba(56,189,248,0.3);}
+@media (prefers-reduced-motion:reduce){.kv-nova-logo-mark,.kv-nova-logo-markwrap::before,.kv-nova-logo-shine{animation:none;}.kv-nova-logo-shine{display:none;}}
 input,select,textarea{font-family:var(--mono);}
 @keyframes pdot{0%,100%{opacity:1}50%{opacity:.2}}
 @keyframes blink{0%,49%{opacity:1}50%,100%{opacity:0}}
@@ -495,7 +520,7 @@ function MultiStagePanel({pkt,staged,onClear,onSend,disabled}){
       {hasAny&&(<div style={{padding:"8px 14px",display:"flex",flexDirection:"column",gap:5}}>{entries.map((e,i)=>{const sv=e.opt.sev?S[e.opt.sev]:null;const col=sv?.c||"var(--amber)";return(<div key={e.field.fieldName} style={{display:"flex",alignItems:"center",gap:8,padding:"6px 10px",borderRadius:6,background:`${col}0e`,border:`1px solid ${col}44`}}><span style={{fontSize:10,fontFamily:"var(--mono)",fontWeight:700,padding:"1px 6px",borderRadius:3,background:`${col}22`,color:col,border:`1px solid ${col}44`,flexShrink:0}}>#{i+1}</span><span style={{fontSize:10,fontFamily:"var(--mono)",fontWeight:700,color:col,flex:1}}>{e.field.fieldName}</span><span style={{fontSize:9,fontFamily:"var(--mono)",color:"var(--ts)"}}>= {e.opt.val} ({e.opt.val.toString(2).padStart(e.field.bitLen,"0")}b)</span><span style={{fontSize:8,color:"var(--td)",fontFamily:"var(--mono)",flexShrink:0}}>bit {e.field.bitStart}</span>{sv&&<span className="tag" style={{background:sv.bg,color:sv.c,border:`1px solid ${sv.ring}`,flexShrink:0}}>{sv.label}</span>}</div>);})}</div>)}
       {hasAny&&(<div style={{padding:"5px 14px",borderTop:`1px solid ${accentColor}22`,background:"rgba(0,0,0,.15)",fontSize:8,color:"var(--td)",fontFamily:"var(--mono)",lineHeight:1.7}}><span style={{color:accentColor,fontWeight:700}}>INJECT ORDER: </span>{entries.map((e,i)=>(<span key={e.field.fieldName}>{i>0&&<span style={{color:"var(--bdr3)"}}> → </span>}<span style={{color:"var(--ts)"}}>{e.field.fieldName}</span><span style={{color:accentColor}}>={e.opt.val}</span><span style={{color:"var(--td)"}}>[{e.field.bitStart}]</span></span>))}</div>)}
       <div style={{padding:"10px 14px",background:hasAny?`${accentColor}0c`:"transparent",borderTop:`1px solid ${hasAny?accentColor+"33":"var(--bdr)"}`}}>
-        <button onClick={e=>{e.stopPropagation();onSend();}} disabled={disabled||!hasAny} className={hasAny?"armed":""} style={{width:"100%",padding:"10px 0",borderRadius:8,border:`2px solid ${hasAny?accentColor:"var(--bdr)"}`,background:hasAny?`linear-gradient(135deg,${accentColor},${accentColor}bb)`:"var(--raised)",color:hasAny?"#fff":"var(--td)",fontSize:12,fontFamily:"var(--mono)",fontWeight:900,letterSpacing:".1em",cursor:hasAny?"pointer":"not-allowed",transition:"all .2s",boxShadow:hasAny?`0 0 20px ${accentColor}44`:"none"}}>{hasAny?`⚡ TRANSMIT ${entries.length}-FIELD PACKET → DECODEX LIVE`:"Stage fields above then transmit"}</button>
+        <button onClick={e=>{e.stopPropagation();onSend();}} disabled={disabled||!hasAny} className={hasAny?"armed":""} style={{width:"100%",padding:"10px 0",borderRadius:8,border:`2px solid ${hasAny?accentColor:"var(--bdr)"}`,background:hasAny?`linear-gradient(135deg,${accentColor},${accentColor}bb)`:"var(--raised)",color:hasAny?"#fff":"var(--td)",fontSize:12,fontFamily:"var(--mono)",fontWeight:900,letterSpacing:".1em",cursor:hasAny?"pointer":"not-allowed",transition:"all .2s",boxShadow:hasAny?`0 0 20px ${accentColor}44`:"none"}}>{hasAny?`⚡ TRANSMIT ${entries.length}-FIELD PACKET → PINJ LIVE`:"Stage fields above then transmit"}</button>
       </div>
     </div>
   );
@@ -540,7 +565,7 @@ export default function PacketSimulator(){
   const tmr=useRef(null),prf=useRef(null),cyc=useRef(0),logR=useRef(null);
 
   useEffect(()=>{document.documentElement.classList.toggle("light",light);localStorage.setItem("kavach-theme",light?"light":"dark");},[light]);
-  // theme changed in the DECODEX tab → follow it here (and vice versa, App listens too)
+  // theme changed in the PINJ tab → follow it here (and vice versa, App listens too)
   useEffect(()=>{const on=e=>{if(e.key==="kavach-theme"&&e.newValue)setLight(e.newValue==="light");};window.addEventListener("storage",on);return()=>window.removeEventListener("storage",on);},[]);
   useEffect(()=>{
     const c=()=>fetch(HEALTH_URL,{signal:AbortSignal.timeout(2000)}).then(()=>setBe(true)).catch(()=>setBe(false));
@@ -656,14 +681,17 @@ export default function PacketSimulator(){
       <div style={{display:"flex",flexDirection:"column",height:"100vh",width:"100vw",overflow:"hidden",background:"var(--void)"}}>
         {/* TOPBAR */}
         <div style={{height:52,display:"flex",alignItems:"center",gap:12,padding:"0 18px",background:"var(--topbg)",borderBottom:"1px solid var(--topbdr)",flexShrink:0,zIndex:10}}>
-          <a href="/" style={{fontSize:10,color:"var(--ts)",fontFamily:"var(--mono)",textDecoration:"none",padding:"3px 10px",borderRadius:5,border:"1px solid var(--bdr2)",background:"var(--raised)",flexShrink:0,transition:"all .15s"}}
-            onMouseEnter={e=>{e.target.style.color="var(--amber)";e.target.style.borderColor="var(--amber)";}}
-            onMouseLeave={e=>{e.target.style.color="var(--ts)";e.target.style.borderColor="var(--bdr2)";}}>← DECODEX</a>
+          <div className="kv-nova-logo" title="NOVA — Engineering Safety · Powering Innovation">
+            <span className="kv-nova-logo-markwrap"><img src="/nova-mark.png" alt="" draggable={false} className="kv-nova-logo-mark" /></span>
+            <span className="kv-nova-logo-wordwrap"><img src="/nova-text-dark.png" alt="NOVA" draggable={false} className="kv-nova-logo-word" /><span className="kv-nova-logo-shine" aria-hidden="true" /></span>
+          </div>
+          <div className="kv-nova-divider" aria-hidden="true" />
+          <a href="/" className="kv-back" title="Back to PINJ">← PINJ</a>
           <div style={{width:1,height:24,background:"var(--bdr2)",flexShrink:0}}/>
           <div style={{width:30,height:30,borderRadius:7,background:"linear-gradient(135deg,#10b981,#059669)",display:"flex",alignItems:"center",justifyContent:"center",fontSize:15,flexShrink:0,boxShadow:"0 0 12px rgba(16,185,129,.35)"}}>📤</div>
           <div>
             <div style={{fontFamily:"var(--hd)",fontSize:16,letterSpacing:".14em",color:"#10b981",lineHeight:1}}>PACKET SIMULATOR</div>
-            <div style={{fontSize:8,color:"var(--tm)",fontFamily:"var(--mono)",marginTop:2,letterSpacing:".04em"}}>KAVACH DECODEX · ADVANCED BIT-LEVEL TEST TOOL · RDSO/SPN/196/2020 V4.0</div>
+            <div style={{fontSize:8,color:"var(--tm)",fontFamily:"var(--mono)",marginTop:2,letterSpacing:".04em"}}>KAVACH PINJ · ADVANCED BIT-LEVEL TEST TOOL · RDSO/SPN/196/2020 V4.0</div>
           </div>
           <div style={{display:"flex",gap:5,marginLeft:12,flexWrap:"wrap"}}>
             {PACKETS.map(p=><span key={p.id} className="tag" style={{background:`${p.color}18`,color:p.color,border:`1px solid ${p.color}44`}}>{p.label}</span>)}
@@ -689,6 +717,7 @@ export default function PacketSimulator(){
             <div style={{width:6,height:6,borderRadius:"50%",background:bc,animation:be===null?"pdot 1.2s infinite":"none"}}/>
             <span style={{fontSize:9,fontFamily:"var(--mono)",fontWeight:700,color:bc}}>BACKEND {bl}</span>
           </div>
+          <UserChip/>
           <ThemeTog light={light} onT={()=>setLight(l=>!l)}/>
         </div>
 
@@ -738,7 +767,7 @@ export default function PacketSimulator(){
                 </div>
               </div>
               <div style={{padding:"13px",display:"flex",flexDirection:"column",gap:7}}>
-                <button onClick={sending?stopAuto:startAuto} disabled={be===false&&!sending}
+                <button onClick={sending?stopAuto:startAuto} disabled={be===false&&!sending} className={sending?undefined:"cine-cta"}
                   style={{position:"relative",overflow:"hidden",padding:"13px 0",borderRadius:8,border:"none",fontSize:12,fontWeight:800,fontFamily:"var(--mono)",letterSpacing:".1em",color:"#fff",transition:"all .2s",background:sending?"linear-gradient(135deg,#dc2626,#991b1b)":"linear-gradient(135deg,#f59e0b,#d97706)",boxShadow:sending?"0 0 20px rgba(220,38,38,.35)":"0 0 20px rgba(245,158,11,.25)"}}>
                   {sending?"⏹ STOP AUTO-SEND":"▶ START AUTO-SEND"}
                   {sending&&<div style={{position:"absolute",bottom:0,left:0,height:3,background:"rgba(255,255,255,.3)",width:`${prog}%`}}/>}
@@ -837,7 +866,7 @@ export default function PacketSimulator(){
                 })}
               </div>
               <div style={{padding:"5px 13px",borderTop:"1px solid var(--bdr)",fontSize:8,color:"var(--tm)",fontFamily:"var(--mono)",background:"var(--ftbg)",flexShrink:0,display:"flex",alignItems:"center",gap:8}}>
-                <span style={{color:"var(--green)"}}>→ DECODEX LIVE</span>
+                <span style={{color:"var(--green)"}}>→ PINJ LIVE</span>
                 <div style={{marginLeft:"auto",display:"flex",gap:5,alignItems:"center"}}>
                   {PACKETS.map(p=>{const n=log.filter(e=>e.label===p.label).length;return n>0?(<span key={p.id} className="tag" style={{background:`${p.color}15`,color:p.color,border:`1px solid ${p.color}30`}}>{p.label}:{n}</span>):null;})}
                   <span style={{color:"var(--td)"}}>{log.length}</span>

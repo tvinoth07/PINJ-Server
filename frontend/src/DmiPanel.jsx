@@ -14,7 +14,7 @@
  * buildDmi() is a pure function: packets in, everything the screen shows out —
  * each value with the packet it came from, so the display can always be traced.
  */
-import { useState, useEffect, useMemo, useRef, Fragment } from "react";
+import { useState, useEffect, useMemo, useRef, useId, Fragment } from "react";
 import { tagTableStore, appSettingsStore, useStore } from "./SettingsAbout";
 
 /* ═══════════════════════════════════════════════════════════════
@@ -70,20 +70,59 @@ function sigMarker(type, aspect) {
   return null;
 }
 /* CUR_SIG_ASPECT → the 4 lamps (top→bottom: YLW, GRN, YLW, BRD) */
-/* Annexure-C CUR_SIG_ASPECT: 3–8 = Yellow with Pos1…Pos6 junction-type route indication,
-   9 = Yellow with other (stencil) type route indication — same yellow lamp as code 2 */
+/* Annexure-C (Amdt-10) CUR_SIG_ASPECT: 3–8 = Yellow with Pos1…Pos6 junction-type route indication,
+   24 = Stop Board / Buffer Stop, 32–63 = Yellow with Stencil route 1…32 (route = code − 31) — same yellow
+   lamp as code 2. 9 = stencil without a route number (Amdt-9; Spare in Amdt-10), kept for older stations. */
+export const STENCIL_MIN = 32, STENCIL_MAX = 63;
+export const stencilNo = a => (a >= STENCIL_MIN && a <= STENCIL_MAX ? a - STENCIL_MIN + 1 : null);
 const ASPECT_LAMPS = {
   1: [0, 0, 0, 1], 2: [0, 0, 1, 0], 3: [0, 0, 1, 0], 4: [0, 0, 1, 0], 5: [0, 0, 1, 0], 6: [0, 0, 1, 0], 7: [0, 0, 1, 0],
   8: [0, 0, 1, 0], 9: [0, 0, 1, 0], 10: [1, 0, 1, 0], 11: [0, 1, 0, 0],
-  14: [0, 0, 0, 1], 15: [0, 0, 0, 1], 48: [0, 0, 0, 1],
+  14: [0, 0, 0, 1], 15: [0, 0, 0, 1], 24: [0, 0, 0, 1],
 };
+for (let a = STENCIL_MIN; a <= STENCIL_MAX; a++) ASPECT_LAMPS[a] = [0, 0, 1, 0];
 export const ASPECT_NAME = { 1: "Red", 2: "Yellow", 3: "Yellow + Route 1", 4: "Yellow + Route 2", 5: "Yellow + Route 3", 6: "Yellow + Route 4",
-  7: "Yellow + Route 5", 8: "Yellow + Route 6", 9: "Yellow + Stencil Route", 10: "Double Yellow", 11: "Green", 14: "AG Marker OFF",
-  15: "Red + Calling-On", 48: "Stop Board" };
-/* junction-type route indication: position 1…6 (aspect 3…8), "stencil" (aspect 9) */
-const routeOf = a => (a >= 3 && a <= 8 ? a - 2 : a === 9 ? "stencil" : null);
-/* Annexure-B Table B.4 route symbols (top-left of each 30 × 30 symbol) + bar angle */
-const ROUTE_SYM = { 1: [587, 24, 45], 2: [580, 59, 0], 3: [585, 85, -45], 4: [714, 24, -45], 5: [723, 59, 0], 6: [718, 85, 45] };
+  7: "Yellow + Route 5", 8: "Yellow + Route 6", 9: "Yellow + Stencil (no route no.)", 10: "Double Yellow", 11: "Green", 14: "AG Marker OFF",
+  15: "Red + Calling-On", 24: "Stop Board" };
+export const aspectName = a => ASPECT_NAME[a] || (stencilNo(a) ? `Yellow + Stencil Route ${stencilNo(a)}` : null);
+/* stencil route number as LCD 7-segment digits: lit segments + faint unlit ones, slightly slanted.
+   Segments a (top) b (top right) c (bottom right) d (bottom) e (bottom left) f (top left) g (middle). */
+const SEG_ON = { 0: "abcdef", 1: "bc", 2: "abdeg", 3: "abcdg", 4: "bcfg", 5: "acdfg", 6: "acdefg", 7: "abc", 8: "abcdefg", 9: "abcdfg" };
+function segPolys(x, y, w, h, t) {
+  const ht = t / 2, g = t * 0.3, m = y + h / 2, L = x + ht, R = x + w - ht, T = y + ht, B = y + h - ht;
+  const H = (x1, x2, yy) => `${x1},${yy} ${x1 + ht},${yy - ht} ${x2 - ht},${yy - ht} ${x2},${yy} ${x2 - ht},${yy + ht} ${x1 + ht},${yy + ht}`;
+  const V = (xx, y1, y2) => `${xx},${y1} ${xx + ht},${y1 + ht} ${xx + ht},${y2 - ht} ${xx},${y2} ${xx - ht},${y2 - ht} ${xx - ht},${y1 + ht}`;
+  return [["a", H(L + g, R - g, T)], ["b", V(R, T + g, m - g)], ["c", V(R, m + g, B - g)], ["d", H(L + g, R - g, B)],
+    ["e", V(L, m + g, B - g)], ["f", V(L, T + g, m - g)], ["g", H(L + g, R - g, m)]];
+}
+function LcdDigits({ value, cx, cy, h, color, off }) {
+  const s = String(value), w = h * 0.56, t = h * 0.14, gap = h * 0.2;
+  const x0 = cx - (s.length * w + (s.length - 1) * gap) / 2, y0 = cy - h / 2;
+  return (
+    <g transform={`translate(${cx} ${cy}) skewX(-7) translate(${-cx} ${-cy})`}>
+      {[...s].map((ch, i) => segPolys(x0 + i * (w + gap), y0, w, h, t).map(([k, pts]) => {
+        const lit = (SEG_ON[ch] || "").includes(k);
+        return <polygon key={i + k} points={pts} fill={lit ? color : off} style={lit ? { filter: `drop-shadow(0 0 1.5px ${color})` } : undefined} />;
+      }))}
+    </g>
+  );
+}
+/* junction-type route indication: position 1…6 (aspect 3…8), "stencil" (aspect 9, 32…63) */
+const routeOf = a => (a >= 3 && a <= 8 ? a - 2 : a === 9 || stencilNo(a) ? "stencil" : null);
+/* Annexure-B Table B.4 route symbols: [X, Y] of the image's top-left (screen units) and the
+   white shape of route1.bmp … route6.bmp (49 × 44; routes 3 and 6: 44 × 49), traced pixel by
+   pixel from the images in the Annexure — so size, shape and position are exactly the spec's. */
+const ROUTE_SYM = {
+  1: [587, 24, "M10 4h5v1h-5zM9 5h7v1h-7zM8 6h10v1h-10zM7 7h12v1h-12zM7 8h13v1h-13zM7 9h14v1h-14zM7 10h15v1h-15zM7 11h16v1h-16zM8 12h15v1h-15zM8 13h16v1h-16zM9 14h16v1h-16zM10 15h16v1h-16zM11 16h16v1h-16zM12 17h16v1h-16zM14 18h15v1h-15zM15 19h15v1h-15zM16 20h15v1h-15zM17 21h14v1h-14zM18 22h14v1h-14zM19 23h14v1h-14zM20 24h14v1h-14zM21 25h14v1h-14zM22 26h14v1h-14zM23 27h14v1h-14zM24 28h14v1h-14zM25 29h14v1h-14zM27 30h13v1h-13zM27 31h14v1h-14zM29 32h12v1h-12zM30 33h12v1h-12zM31 34h11v1h-11zM32 35h10v1h-10zM33 36h9v1h-9zM34 37h8v1h-8zM38 38h4v1h-4zM41 39h1v1h-1z"],
+  2: [580, 59, "M7 16h11v1h-11zM4 17h33v1h-33zM3 18h41v1h-41zM2 19h44v1h-44zM2 20h45v1h-45zM1 21h48v1h-48zM1 22h48v1h-48zM1 23h47v1h-47zM2 24h44v1h-44zM2 25h42v1h-42zM3 26h40v1h-40zM5 27h20v1h-20z"],
+  3: [585, 85, "M33 7h7v1h-7zM31 8h8v1h-8zM30 9h9v1h-9zM29 10h10v1h-10zM28 11h10v1h-10zM27 12h11v1h-11zM26 13h12v1h-12zM25 14h13v1h-13zM24 15h13v1h-13zM23 16h13v1h-13zM22 17h13v1h-13zM20 18h14v1h-14zM19 19h14v1h-14zM18 20h14v1h-14zM17 21h15v1h-15zM16 22h14v1h-14zM15 23h15v1h-15zM14 24h15v1h-15zM13 25h15v1h-15zM11 26h16v1h-16zM10 27h16v1h-16zM9 28h16v1h-16zM8 29h16v1h-16zM7 30h16v1h-16zM6 31h16v1h-16zM6 32h15v1h-15zM5 33h15v1h-15zM4 34h15v1h-15zM4 35h14v1h-14zM4 36h14v1h-14zM4 37h13v1h-13zM4 38h12v1h-12zM5 39h10v1h-10zM6 40h8v1h-8zM7 41h5v1h-5z"],
+  4: [706, 24, "M34 4h5v1h-5zM33 5h7v1h-7zM31 6h10v1h-10zM30 7h12v1h-12zM29 8h13v1h-13zM28 9h14v1h-14zM27 10h15v1h-15zM26 11h16v1h-16zM26 12h15v1h-15zM25 13h16v1h-16zM24 14h16v1h-16zM23 15h16v1h-16zM22 16h16v1h-16zM21 17h16v1h-16zM20 18h15v1h-15zM19 19h15v1h-15zM18 20h15v1h-15zM18 21h14v1h-14zM17 22h14v1h-14zM16 23h14v1h-14zM15 24h14v1h-14zM14 25h14v1h-14zM13 26h14v1h-14zM12 27h14v1h-14zM11 28h14v1h-14zM10 29h14v1h-14zM9 30h13v1h-13zM8 31h14v1h-14zM8 32h12v1h-12zM7 33h12v1h-12zM7 34h11v1h-11zM7 35h10v1h-10zM7 36h9v1h-9zM7 37h8v1h-8zM7 38h4v1h-4zM7 39h1v1h-1z"],
+  5: [715, 59, "M31 16h11v1h-11zM12 17h33v1h-33zM5 18h41v1h-41zM3 19h44v1h-44zM2 20h45v1h-45zM0 21h48v1h-48zM0 22h48v1h-48zM1 23h47v1h-47zM3 24h44v1h-44zM5 25h42v1h-42zM6 26h40v1h-40zM24 27h20v1h-20z"],
+  6: [710, 85, "M4 7h7v1h-7zM5 8h8v1h-8zM5 9h9v1h-9zM5 10h10v1h-10zM6 11h10v1h-10zM6 12h11v1h-11zM6 13h12v1h-12zM6 14h13v1h-13zM7 15h13v1h-13zM8 16h13v1h-13zM9 17h13v1h-13zM10 18h14v1h-14zM11 19h14v1h-14zM12 20h14v1h-14zM12 21h15v1h-15zM14 22h14v1h-14zM14 23h15v1h-15zM15 24h15v1h-15zM16 25h15v1h-15zM17 26h16v1h-16zM18 27h16v1h-16zM19 28h16v1h-16zM20 29h16v1h-16zM21 30h16v1h-16zM22 31h16v1h-16zM23 32h15v1h-15zM24 33h15v1h-15zM25 34h15v1h-15zM26 35h14v1h-14zM26 36h14v1h-14zM27 37h13v1h-13zM28 38h12v1h-12zM29 39h10v1h-10zM30 40h8v1h-8zM32 41h5v1h-5z"],
+};
+/* Signal head (Annexure-B B4.6.4.2 dimensions): 70 wide × 220 high with 45° corners, four lamps of
+   44 units, 12 units from the top and 8 units apart — centred between the Table B.4 route symbols. */
+const SIG_X = 636, SIG_Y = 70, SIG_W = 70, SIG_H = 220, SIG_CX = SIG_X + SIG_W / 2, SIG_C = 12;
 
 const EMRG_SELF = { 1: "Stopped in Block section", 2: "Manual", 6: "Train Parted" };
 const BRAKE_TXT = { 1: "Over speed", 2: "Normal Service Brake", 3: "Full Service Brake", 4: "Emergency Brake" };
@@ -250,6 +289,9 @@ export function useSmoothValues(target, ms = 700, ids = {}) {
    DMI ENGINE
 ═══════════════════════════════════════════════════════════════ */
 /** All loco IDs present in the feed (from C.4.3 / C.4.6), newest activity first. */
+const CUE_SAME_PLACE_M = 50;   // a speed drop this close to a turnout belongs to that turnout
+const CUE_TURNOUT_M = 2000, CUE_PSR_M = 1500;   // the distances the DMI starts showing them (target ≤ 2000 m, PSR message ≤ 1500 m)
+
 export function dmiLocoIds(packets) {
   const last = new Map();
   for (const p of packets) {
@@ -617,13 +659,77 @@ export function buildDmi(packets, locoId, now = Date.now(), tagLoc = {}, opts = 
     tags: mTags,                                                              // M1 latest, M2, M3 — { id, status }
     route, sg, refLoc: refTag > 0 ? refLocOf(refTag) : null,
     tagEvents: tagEvents.slice(-12), missedTags: tagEvents.filter(t => t.status === "missed").map(t => t.id),
-    lamps, aspect, aspectName: ASPECT_NAME[aspect] || (hasStn ? `Code ${aspect}` : "—"), marker: sigMarker(sigType, aspect),
+    lamps, aspect, aspectName: aspectName(aspect) || (hasStn ? `Code ${aspect}` : "—"), marker: sigMarker(sigType, aspect),
     routeInd: lamps ? routeOf(aspect) : null,
+    stencil: lamps ? stencilNo(aspect) : null,          // stencil route number 1…32 (Amdt-10), else null
     nextAspect: hasStn && dirOk ? S.NEXT_SIG_ASPECT ?? null : null,
-    nextAspectName: hasStn && dirOk && S.NEXT_SIG_ASPECT != null ? (S.NEXT_SIG_ASPECT === 0 ? "— (current is Red)" : ASPECT_NAME[S.NEXT_SIG_ASPECT] || `Code ${S.NEXT_SIG_ASPECT}`) : null,
+    nextAspectName: hasStn && dirOk && S.NEXT_SIG_ASPECT != null ? (S.NEXT_SIG_ASPECT === 0 ? "— (current is Red)" : aspectName(S.NEXT_SIG_ASPECT) || `Code ${S.NEXT_SIG_ASPECT}`) : null,
     d3, sigDist, ma, maRaw, sigInfo, sigType, lineCode, osSpeed, destSos, refTag, offset, offsetHow,
     sectionSpeed, permitted, target, speedTarget, nextTag: nextTag && p != null ? { id: nextTag.id, dist: nextTag.at - p } : null,
     rf: Math.min(5, rf), radioHole, H, I, src, stnId: S.SOURCE_STN_ILC_IBS_ID ?? null,
+    // 🗣 route announcements: profile position + what lies on it (same PSR rule as the targets above)
+    cueTrack: p == null ? null : {
+      p,
+      turnouts: track.turnouts.map(t => t.start),
+      // The speed profile also drops at a turnout: that drop is the turnout, not a separate PSR.
+      psrs: track.ssp.filter((e, i) => i > 0 && e.speed < track.ssp[i - 1].speed
+        && !track.turnouts.some(t => Math.abs(t.start - e.from) <= CUE_SAME_PLACE_M)).map(e => e.from),
+    },
+  };
+}
+
+/**
+ * 🗣 Route announcements for one loco at a time, from its buildDmi() result. A signal is announced
+ * as soon as the C.4.2 gives it, then every repeatMs until it is passed. A turnout or PSR is announced
+ * from the distance the DMI starts showing it, every profileRepeatMs until it is entered, then
+ * once on entering. Repeats need a moving loco; the first announcement also plays at a standstill. Positions are compared on the ABS scale so a new C.4.2 profile (which restarts
+ * the profile's own distances) doesn't announce the same turnout or PSR again.
+ */
+export function createVoiceCueTracker() {
+  const locos = new Map();
+  return {
+    reset() { locos.clear(); },
+    update(d, repeatMs = 0, profileRepeatMs = 0, now = Date.now()) {
+      let st = locos.get(d.locoId);
+      if (!st) { st = { abs: null, sigDist: null, sigCue: null, sigAt: 0, said: new Set(), saidAt: new Map() }; locos.set(d.locoId, st); }
+      const cues = new Set();
+      const moving = d.speed > 0;
+      if (st.abs != null && d.abs != null && d.sg && d.sg * (d.abs - st.abs) < -200) {   // run restarted
+        st.said.clear(); st.saidAt.clear(); st.sigCue = null; st.abs = null;
+      }
+
+      /* Signal ahead, from the lamps the DMI shows. Announced again if the aspect changes, or
+         for the next signal (the distance jumps up). */
+      const sigCue = !d.lamps ? null : d.lamps[3] ? "danger" : d.lamps[0] && d.lamps[2] ? "attention" : d.lamps[2] ? "caution" : d.lamps[1] ? "proceed" : null;
+      const dist = d.sigDist;
+      if (!sigCue || dist == null || dist <= 0) st.sigCue = null;
+      else {
+        if (st.sigDist != null && dist > st.sigDist + 300) st.sigCue = null;
+        if (st.sigCue !== sigCue || (moving && repeatMs > 0 && now - st.sigAt >= repeatMs)) { cues.add(sigCue); st.sigCue = sigCue; st.sigAt = now; }
+      }
+      st.sigDist = dist;
+
+      /* Turnouts and PSRs ahead */
+      if (d.cueTrack && d.abs != null && d.sg) {
+        const { p, turnouts, psrs } = d.cueTrack;
+        const check = (starts, kind, nearM, approachCue, enteredCue) => starts.forEach(start => {
+          const at = d.abs + d.sg * (start - p);
+          const key = kind + Math.round(at / 50);
+          const ahead = start - p;
+          const crossed = st.abs != null && d.sg * (st.abs - at) < 0 && ahead <= 0 && ahead > -400;
+          if (crossed && !st.said.has(key + "in")) {
+            st.said.add(key + "in"); st.said.add(key); cues.add(enteredCue);
+          } else if (ahead > 0 && ahead <= nearM && !st.said.has(key + "in")
+            && (!st.said.has(key) || (moving && profileRepeatMs > 0 && now - st.saidAt.get(key) >= profileRepeatMs))) {
+            st.said.add(key); st.saidAt.set(key, now); cues.add(approachCue);
+          }
+        });
+        check(turnouts, "T", CUE_TURNOUT_M, "approachTurnout", "enteredTurnout");
+        check(psrs, "P", CUE_PSR_M, "approachPsr", "enteredPsr");
+      }
+      if (d.abs != null) st.abs = d.abs;
+      return ["danger", "attention", "caution", "proceed", "enteredTurnout", "enteredPsr", "approachTurnout", "approachPsr"].filter(c => cues.has(c));
+    },
   };
 }
 
@@ -713,9 +819,113 @@ const DIAL_TICKS = (() => {
   return out;
 })();
 
+/* ═══════════════════════════════════════════════════════════════
+   NOVA SPLASH — 5 s start-up screen over the DMI (the 📡 LIVE DMI and the DMI SIM), with the
+   header's NOVA mark + wordmark and the PINJ title. It plays once, when the screen is first
+   visible; then the DMI shows its normal state.
+═══════════════════════════════════════════════════════════════ */
+const SPLASH_MS = 5000;
+const SPLASH_CSS = `
+.nsp { animation: nspOut .6s ease-in 4.4s both; transform-box: view-box; transform-origin: 400px 300px; }
+.nsp-bar  { transform-box: fill-box; animation: nspBar 1s cubic-bezier(.7,0,.2,1) .15s both; }
+.nsp-bar.t { transform-origin: 50% 0; } .nsp-bar.b { transform-origin: 50% 100%; }
+.nsp-glow { animation: nspFade 1.4s ease-out .4s both; }
+.nsp-mark { transform-box: fill-box; transform-origin: center; animation: nspMark 1.3s cubic-bezier(.2,.7,.2,1) .6s both; }
+.nsp-word { animation: nspWord 1.1s cubic-bezier(.2,.7,.2,1) 1s both; }
+.nsp-shine { animation: nspShine 1s ease-in-out 1.9s both; }
+.nsp-line { transform-box: fill-box; transform-origin: center; animation: nspLine .8s cubic-bezier(.2,.7,.2,1) 2s both; }
+.nsp-title { animation: nspTitle 1s cubic-bezier(.2,.7,.2,1) 2.1s both; }
+.nsp-tag { animation: nspFade .8s ease-out 2.7s both; }
+.nsp-foot { animation: nspFade .8s ease-out 3s both; }
+.nsp-prog { transform-box: fill-box; transform-origin: 0 50%; animation: nspProg 3.6s cubic-bezier(.4,0,.2,1) .8s both; }
+.nsp-flare { animation: nspFlare 1.6s ease-in-out .9s both; }
+@keyframes nspOut   { from { opacity: 1; transform: scale(1); } to { opacity: 0; transform: scale(1.04); } }
+@keyframes nspBar   { from { transform: scaleY(5); } to { transform: scaleY(1); } }
+@keyframes nspFade  { from { opacity: 0; } to { opacity: 1; } }
+@keyframes nspMark  { from { opacity: 0; transform: scale(1.35); filter: blur(10px); } to { opacity: 1; transform: scale(1); filter: blur(0); } }
+@keyframes nspWord  { from { opacity: 0; transform: translateX(34px); filter: blur(6px); } to { opacity: 1; transform: none; filter: blur(0); } }
+@keyframes nspShine { from { transform: translateX(-260px); } to { transform: translateX(360px); } }
+@keyframes nspLine  { from { transform: scaleX(0); opacity: 0; } to { transform: scaleX(1); opacity: 1; } }
+@keyframes nspTitle { from { opacity: 0; letter-spacing: .55em; } to { opacity: 1; letter-spacing: .12em; } }
+@keyframes nspProg  { from { transform: scaleX(0); } to { transform: scaleX(1); } }
+@keyframes nspFlare { 0% { opacity: 0; transform: translateX(-420px); } 35% { opacity: .9; } 100% { opacity: 0; transform: translateX(420px); } }
+@media (prefers-reduced-motion: reduce) { .nsp * { animation-duration: .01s !important; animation-delay: 0s !important; } }
+`;
+function NovaSplash({ uid }) {
+  const glow = `nspGlow${uid}`, shineG = `nspShineG${uid}`, wordM = `nspWordM${uid}`, flareG = `nspFlareG${uid}`;
+  const WX = 318, WY = 186, WW = 302, WH = 89;                 // wordmark 112 × 33 → 302 × 89
+  return (
+    <g className="nsp" pointerEvents="none">
+      <style>{SPLASH_CSS}</style>
+      <defs>
+        <radialGradient id={glow} cx="50%" cy="42%" r="60%">
+          <stop offset="0" stopColor="#0d4a7a" stopOpacity=".55" /><stop offset=".55" stopColor="#06213a" stopOpacity=".25" /><stop offset="1" stopColor="#000" stopOpacity="0" />
+        </radialGradient>
+        <linearGradient id={shineG} x1="0" x2="1" y1="0" y2="0">
+          <stop offset="0" stopColor="#fff" stopOpacity="0" /><stop offset=".5" stopColor="#fff" stopOpacity=".95" /><stop offset="1" stopColor="#fff" stopOpacity="0" />
+        </linearGradient>
+        <linearGradient id={flareG} x1="0" x2="1" y1="0" y2="0">
+          <stop offset="0" stopColor="#22d3ee" stopOpacity="0" /><stop offset=".5" stopColor="#bdf4ff" stopOpacity=".9" /><stop offset="1" stopColor="#22d3ee" stopOpacity="0" />
+        </linearGradient>
+        <mask id={wordM} maskUnits="userSpaceOnUse" x="0" y="0" width="800" height="600">
+          <image href="/nova-text-dark.png" x={WX} y={WY} width={WW} height={WH} preserveAspectRatio="none" />
+        </mask>
+      </defs>
+      <rect x={0} y={0} width={800} height={600} fill="#000" />
+      <rect className="nsp-glow" x={0} y={0} width={800} height={600} fill={`url(#${glow})`} />
+      {/* NOVA mark + wordmark, as in the header */}
+      <image className="nsp-mark" href="/nova-mark.png" x={180} y={170} width={122} height={122} />
+      <g className="nsp-word">
+        <image href="/nova-text-dark.png" x={WX} y={WY} width={WW} height={WH} />
+        <g mask={`url(#${wordM})`}>
+          <rect className="nsp-shine" x={WX - 40} y={WY - 10} width={90} height={WH + 20} fill={`url(#${shineG})`} transform="skewX(-18)" />
+        </g>
+      </g>
+      {/* lens flare across the logo */}
+      <rect className="nsp-flare" x={200} y={233} width={400} height={2} fill={`url(#${flareG})`} />
+      <rect className="nsp-line" x={180} y={322} width={440} height={1.5} fill="#22d3ee" opacity=".7" />
+      <text className="nsp-title" x={400} y={362} textAnchor="middle" fontSize={21} fontWeight="bold" fill="#fff" fontFamily={FONT}>
+        <tspan fill="#22d3ee">PINJ</tspan> — KAVACH PACKET INJECTOR &amp; DECODER
+      </text>
+      <text className="nsp-tag" x={400} y={394} textAnchor="middle" fontSize={15} fontStyle="italic" fill="#9fb3c8" fontFamily={FONT}>
+        Engineering Safety · Powering Innovation
+      </text>
+      <text className="nsp-foot" x={400} y={500} textAnchor="middle" fontSize={12} fill="#5f7286" letterSpacing="3" fontFamily={FONT}>
+        LP-OCIP · RDSO/SPN/196/2020 · ANNEXURE-B
+      </text>
+      <rect x={250} y={524} width={300} height={3} rx={1.5} fill="#16202c" />
+      <rect className="nsp-prog" x={250} y={524} width={300} height={3} rx={1.5} fill="#22d3ee" />
+      {/* cinematic letterbox */}
+      <rect className="nsp-bar t" x={0} y={0} width={800} height={60} fill="#000" />
+      <rect className="nsp-bar b" x={0} y={540} width={800} height={60} fill="#000" />
+    </g>
+  );
+}
+/** "wait" until the screen is first displayed (e.g. the DMI SIM tab is opened — the page keeps it
+    mounted but hidden), then "play" for SPLASH_MS, then "done" */
+function useSplash(ref) {
+  const [phase, setPhase] = useState("wait");
+  useEffect(() => {
+    if (phase !== "wait") return undefined;
+    const shown = () => { const el = ref.current; return !!el && el.getClientRects().length > 0 && document.visibilityState === "visible"; };
+    if (shown()) { setPhase("play"); return undefined; }
+    const t = setInterval(() => { if (shown()) setPhase("play"); }, 200);
+    return () => clearInterval(t);
+  }, [phase, ref]);
+  useEffect(() => {
+    if (phase !== "play") return undefined;
+    const t = setTimeout(() => setPhase("done"), SPLASH_MS);
+    return () => clearTimeout(t);
+  }, [phase]);
+  return phase;
+}
+
 /** The LP-OCIP screen itself — always black, like the real panel. */
 export function DmiScreen({ d, now }) {
   const { dmiSmooth } = useStore(appSettingsStore);
+  const svgRef = useRef(null);
+  const splash = useSplash(svgRef);                     // NOVA start-up screen first
+  const uid = useId().replace(/[^a-zA-Z0-9]/g, "");
   const date = new Date(now);
   const p2 = n => String(n).padStart(2, "0");
   const dateS = `${p2(date.getDate())}-${["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"][date.getMonth()]}-${date.getFullYear()}`;
@@ -748,7 +958,7 @@ export function DmiScreen({ d, now }) {
   const maTop = maS == null ? null : maS > 3000 ? 45 : scaleY(C_MARKS, maS);
 
   return (
-    <svg viewBox="0 0 800 600" width="100%" height="100%" preserveAspectRatio="xMidYMid meet"
+    <svg ref={svgRef} viewBox="0 0 800 600" width="100%" height="100%" preserveAspectRatio="xMidYMid meet"
       style={{ display: "block", background: DMI_COL.BLK, fontFamily: FONT }}>
       <rect x={0} y={0} width={800} height={600} fill={DMI_COL.BLK} />
 
@@ -828,28 +1038,32 @@ export function DmiScreen({ d, now }) {
       {/* ── Region D — signal (231 wide) ── */}
       <g>
         {d.lamps && <>
-          {/* head: rectangle with chamfered corners */}
-          <path d="M660,62 H700 L712,74 V274 L700,286 H660 L648,274 V74 Z" fill="none" stroke={DMI_COL.GRY} strokeWidth={2} />
+          {/* head: 70 × 220 with 45° corners (B4.6.4.2) */}
+          <path d={`M${SIG_X + SIG_C},${SIG_Y} H${SIG_X + SIG_W - SIG_C} L${SIG_X + SIG_W},${SIG_Y + SIG_C} V${SIG_Y + SIG_H - SIG_C} L${SIG_X + SIG_W - SIG_C},${SIG_Y + SIG_H} H${SIG_X + SIG_C} L${SIG_X},${SIG_Y + SIG_H - SIG_C} V${SIG_Y + SIG_C} Z`}
+            fill="none" stroke={DMI_COL.GRY} strokeWidth={2} />
           {[0, 1, 2, 3].map(i => {
             const on = d.lamps[i];
             const col = [DMI_COL.YLW, DMI_COL.GRN, DMI_COL.YLW, DMI_COL.BRD][i];
-            return <circle key={i} cx={680} cy={98 + i * 50} r={19} fill={on ? col : DMI_COL.BLK} stroke={W} strokeWidth={2} />;
+            // 44-unit lamps (outer edge of the 2-unit white ring), 12 from the top, 8 apart
+            return <circle key={i} cx={SIG_CX} cy={SIG_Y + 12 + 22 + i * 52} r={21} fill={on ? col : DMI_COL.BLK} stroke={W} strokeWidth={2} />;
           })}
           {/* route indication (B4.6.4.1 e, Table B.4): junction route bar 1…6 beside the head,
-              or the stencil indicator above it — from CUR_SIG_ASPECT 3…8 / 9 */}
+              or the stencil indicator above it — from CUR_SIG_ASPECT 3…8 / 9, 32…63 (route 1…32 shown in it).
+              Table B.4 places Stencil.bmp at X 660; the box is centred on the signal head (SIG_CX). */}
           {typeof d.routeInd === "number" && ROUTE_SYM[d.routeInd] && (() => {
-            const [rx, ry, deg] = ROUTE_SYM[d.routeInd];
-            return <rect x={rx} y={ry + 11} width={30} height={8} rx={4} fill={W} transform={`rotate(${deg} ${rx + 15} ${ry + 15})`} />;
+            const [rx, ry, shape] = ROUTE_SYM[d.routeInd];
+            return <path d={shape} fill={W} transform={`translate(${rx} ${ry})`} shapeRendering="crispEdges" />;
           })()}
           {d.routeInd === "stencil" && <g>
-            <rect x={660} y={20} width={40} height={30} rx={3} fill={DMI_COL.BLK} stroke={W} strokeWidth={2} />
-            {[0, 1, 2, 3, 4].map(r => [0, 1, 2, 3, 4, 5, 6].map(c => <circle key={`${r}${c}`} cx={665 + c * 5} cy={25 + r * 5} r={1.1} fill={DMI_COL.LGY} />))}
+            <rect x={SIG_CX - 20} y={20} width={40} height={30} rx={3} fill={DMI_COL.BLK} stroke={W} strokeWidth={2} />
+            {d.stencil ? <LcdDigits value={d.stencil} cx={SIG_CX} cy={35} h={20} color={W} off="#262626" />
+              : [0, 1, 2, 3, 4].map(r => [0, 1, 2, 3, 4, 5, 6].map(c => <circle key={`${r}${c}`} cx={SIG_CX - 15 + c * 5} cy={25 + r * 5} r={1.1} fill={DMI_COL.LGY} />))}
           </g>}
           {/* post · marker circle (C / IB / G / A / AG — white with letter when active) · post */}
-          <line x1={680} y1={286} x2={680} y2={302} stroke={W} strokeWidth={2} />
-          <circle cx={680} cy={316} r={14} fill={d.marker ? W : DMI_COL.BLK} stroke={W} strokeWidth={2} />
-          {d.marker && <text x={680} y={321} textAnchor="middle" fontSize={d.marker.length > 1 ? 12 : 15} fontWeight="bold" fill={DMI_COL.BLK}>{d.marker}</text>}
-          <line x1={680} y1={330} x2={680} y2={346} stroke={W} strokeWidth={2} />
+          <line x1={SIG_CX} y1={SIG_Y + SIG_H} x2={SIG_CX} y2={302} stroke={W} strokeWidth={2} />
+          <circle cx={SIG_CX} cy={316} r={14} fill={d.marker ? W : DMI_COL.BLK} stroke={W} strokeWidth={2} />
+          {d.marker && <text x={SIG_CX} y={321} textAnchor="middle" fontSize={d.marker.length > 1 ? 12 : 15} fontWeight="bold" fill={DMI_COL.BLK}>{d.marker}</text>}
+          <line x1={SIG_CX} y1={330} x2={SIG_CX} y2={346} stroke={W} strokeWidth={2} />
         </>}
         {d.sigDist != null && d.lamps && <text x={680} y={372} textAnchor="middle" fontSize={20} fontWeight="bold" fill={W}>{pad(sm.sig ?? d.sigDist, 4)} m</text>}
       </g>
@@ -932,6 +1146,10 @@ export function DmiScreen({ d, now }) {
       {!d.hasLoco && !d.hasStn && (
         <text x={10} y={477} fontSize={20} fill={DMI_COL.LGY}>Waiting for radio packets…</text>
       )}
+
+      {/* NOVA start-up splash on top (black until the screen is visible, then 5 s) */}
+      {splash === "wait" && <rect x={0} y={0} width={800} height={600} fill={DMI_COL.BLK} />}
+      {splash === "play" && <NovaSplash uid={uid} />}
     </svg>
   );
 }
@@ -1082,7 +1300,8 @@ function DvSignal({ d }) {
       })()}
       {on && d.routeInd === "stencil" && <g className="dv-route">
         <rect x={56} y={2} width={38} height={22} rx={3} fill="#05070b" stroke="#f8fafc" strokeWidth={1.6} />
-        {[0, 1, 2, 3].map(r => [0, 1, 2, 3, 4, 5].map(c => <circle key={`${r}${c}`} cx={62 + c * 5.2} cy={7 + r * 4.4} r={1} fill="#94a3b8" />))}
+        {d.stencil ? <LcdDigits value={d.stencil} cx={75} cy={13} h={14} color="#f8fafc" off="#1c2230" />
+          : [0, 1, 2, 3].map(r => [0, 1, 2, 3, 4, 5].map(c => <circle key={`${r}${c}`} cx={62 + c * 5.2} cy={7 + r * 4.4} r={1} fill="#94a3b8" />))}
       </g>}
       <path d="M62,28 H88 L100,40 V148 L88,160 H62 L50,148 V40 Z" fill="#0b0d12" stroke={head} strokeWidth={2} />
       {[0, 1, 2, 3].map(i => {
@@ -1282,7 +1501,7 @@ export default function DmiView({ livePackets, wsState, isLight }) {
                 </div>
                 <div className="dv-rows" style={{ marginTop: 4, marginLeft: -10 }}>
                   <div><span className="k">Marker</span><span className="v">{d.lamps && d.marker ? `${d.marker} · ${MARKER_TXT[d.marker] || ""}` : "—"}</span></div>
-                  <div><span className="k">Route</span><span className="v">{d.lamps && d.routeInd ? (d.routeInd === "stencil" ? "Stencil" : `Junction · pos ${d.routeInd}`) : "—"}</span></div>
+                  <div><span className="k">Route</span><span className="v">{d.lamps && d.routeInd ? (d.routeInd === "stencil" ? (d.stencil ? `Stencil · route ${d.stencil}` : "Stencil") : `Junction · pos ${d.routeInd}`) : "—"}</span></div>
                   <div><span className="k">Next signal</span><span className="v">{d.nextAspectName || "—"}</span></div>
                 </div>
               </div>

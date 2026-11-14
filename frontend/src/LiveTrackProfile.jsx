@@ -1,5 +1,6 @@
-import { useState, useEffect, useMemo, useRef, useCallback } from "react";
-import { playBrakeAlert, playSosAlert, sosCategory, SOS_SOUNDS, stopAlertSound, soundSettingsStore, useStore } from "./SettingsAbout";
+import { useState, useEffect, useLayoutEffect, useMemo, useRef, useCallback } from "react";
+import { playBrakeAlert, playSosAlert, sosCategory, SOS_SOUNDS, stopAlertSound, soundSettingsStore, svkSettingsStore, useStore } from "./SettingsAbout";
+import { StyledLoco, LOCO_STYLE_CSS } from "./LocoStyles";
 
 /* ═══════════════════════════════════════════════════════════════════════════
  * LiveTrackProfile.jsx
@@ -923,7 +924,15 @@ function PacketPanel({ title, spec, accent, pkt, fields }) {
    (a lone circle at 4-6px read as "just a dot", especially since emoji
    glyph rendering varies a lot across fonts/platforms). Pure vector
    shapes so it always renders identically. */
-function LocoIcon({ color, size = 22, speed = 0, reverse = false, brake = 0, emergency = 0, tilt = 0 }) {
+/* The loco icon in the style chosen in ⚙ Settings → SVK SIM → Loco icon: "classic" is the one
+   below, the others come from LocoStyles.jsx (same props, same rail line). */
+function LocoIcon(props) {
+  const { locoStyle } = useStore(svkSettingsStore);
+  if (!locoStyle || locoStyle === "classic") return <ClassicLoco {...props}/>;
+  return <StyledLoco style={locoStyle} {...props}/>;
+}
+
+function ClassicLoco({ color, size = 22, speed = 0, reverse = false, brake = 0, emergency = 0, tilt = 0 }) {
   const w = size, h = size * 0.62;
   const BODY = "#facc15";                   // loco body: yellow
   const BODY_EDGE = "#a16207";              // darker yellow-brown outline so it stays crisp on any background
@@ -1100,6 +1109,86 @@ const CHART_H_RATIO = 0.36;
 // Toolbar row above the chart (layer switcher + zoom): reserved height and gap.
 const TOOLBAR_H_PX = 32, TOOLBAR_GAP_PX = 8;
 
+/* ── Smooth loco motion ──────────────────────────────────────────────────
+   Loco packets arrive unevenly (about 0.7 s and 1.3 s apart, with longer gaps
+   when the radio misses some), so gliding to each new position with a fixed
+   CSS transition made the icon stop, rush and stop again. Instead, every
+   animation frame moves the icon at the loco's REPORTED speed from its last
+   reported position, and gently corrects any difference when a packet comes.
+   Display only: the trail, brake dots and decoded values stay exactly as
+   reported. The icon holds its position once no new position has arrived for
+   LOCO_DR_MAX_S, and never moves backward while the loco is running. */
+const LOCO_DR_MAX_S = 8;        // keep moving through a gap for at most this long
+const LOCO_CORRECT_TAU_S = 1.2; // how gently a position difference is corrected
+const LOCO_SPEED_TAU_S = 0.8;   // how gently the icon follows a speed change
+const LOCO_SNAP_M = 500;        // a bigger jump is a new run or new calibration: go straight there
+
+function LocoMotion({ loco, xS, yS, color, opacity, children }) {
+  const gRef = useRef(null);
+  const tipRef = useRef(null);
+  const latest = useRef(null);
+  latest.current = { loco, xS, yS };
+  const motion = useRef(null);
+
+  useLayoutEffect(() => {
+    let raf = 0;
+    let last = performance.now();
+    const draw = (m, now) => {
+      const cur = latest.current;
+      const x = cur.xS(m.d), y = cur.yS(m.spd);
+      if (gRef.current) gRef.current.style.transform = `translate(${x}px, ${y}px)`;
+      const tip = (cur.loco.trail || [])[(cur.loco.trail || []).length - 1];
+      const line = tipRef.current;
+      if (line) {
+        if (tip && Math.abs(tip.d - m.d) > 1) {
+          line.setAttribute("x1", cur.xS(tip.d)); line.setAttribute("y1", cur.yS(tip.spd));
+          line.setAttribute("x2", x); line.setAttribute("y2", y);
+          line.setAttribute("visibility", "visible");
+        } else line.setAttribute("visibility", "hidden");
+      }
+    };
+    const frame = now => {
+      const dt = Math.min(1, (now - last) / 1000);
+      last = now;
+      const l = latest.current.loco;
+      const reported = Number.isFinite(l.distFromOrigin) ? l.distFromOrigin : l.monoDist;
+      const speed = l.speed || 0;
+      let m = motion.current;
+      if (!m) {
+        m = motion.current = { d: reported, spd: speed, repD: reported, repAt: now, sign: 0, against: 0 };
+      } else if (reported !== m.repD) {
+        const delta = reported - m.repD;
+        const dirn = Math.sign(delta);
+        if (Math.abs(delta) > LOCO_SNAP_M) {
+          m.d = reported; m.repD = reported; m.repAt = now; m.against = 0; m.spd = speed;
+        } else if (!m.sign || dirn === m.sign || ++m.against >= 2) {
+          // One packet against the direction of travel is ignored; two in a row is a real reversal.
+          m.sign = dirn; m.against = 0; m.repD = reported; m.repAt = now;
+        }
+      }
+      m.spd += (speed - m.spd) * (1 - Math.exp(-dt / LOCO_SPEED_TAU_S));
+      const age = (now - m.repAt) / 1000;
+      const running = m.sign !== 0 && speed > 0 && age < LOCO_DR_MAX_S;
+      const v = running ? m.sign * speed / 3.6 : 0;
+      const predicted = m.repD + m.sign * (speed / 3.6) * Math.min(age, LOCO_DR_MAX_S);
+      const next = m.d + v * dt + ((speed > 0 ? predicted : m.repD) - m.d) * (1 - Math.exp(-dt / LOCO_CORRECT_TAU_S));
+      if (!m.sign || (next - m.d) * m.sign >= 0) m.d = next;
+      draw(m, now);
+      raf = requestAnimationFrame(frame);
+    };
+    frame(last);
+    return () => cancelAnimationFrame(raf);
+  }, []);
+
+  return (
+    <>
+      <line ref={tipRef} stroke={color} strokeWidth={1.5} strokeDasharray="3,5" opacity={0.55}
+        visibility="hidden" pointerEvents="none" />
+      <g ref={gRef} style={{ transition: "opacity 0.6s", opacity }}>{children}</g>
+    </>
+  );
+}
+
 function TrackChart({ layers, locos, primaryId, chainageOffset = 0, absDir = 1, tagLocationMap = null, absKnown = false }) {
   // The viewBox is sized from the container's REAL pixel size divided by a
   // constant UNIT, so the plot always fills the whole area (no letterboxing)
@@ -1245,8 +1334,6 @@ function TrackChart({ layers, locos, primaryId, chainageOffset = 0, absDir = 1, 
   // until "⟲ FIT" is clicked to resume auto-following.
   const [zoom, setZoom] = useState(1);
   const [manualCenter, setManualCenter] = useState(null);
-  const [isZooming, setIsZooming] = useState(false);
-  const zoomTimeoutRef = useRef(null);
   // Which profile layers are currently shown — lets the person declutter
   // the chart down to just what they care about right now (e.g. only SSP +
   // RFID tags while chasing a speed-restriction issue), or bring everything
@@ -1371,51 +1458,6 @@ function TrackChart({ layers, locos, primaryId, chainageOffset = 0, absDir = 1, 
     setHoverPt(null);
   };
   useEffect(() => () => { if (hoverRafRef.current != null) cancelAnimationFrame(hoverRafRef.current); }, []);
-  const prevZoomRef = useRef(zoom);
-
-  // Detect zoom changes and disable loco transition during zoom
-  useEffect(() => {
-    if (prevZoomRef.current !== zoom) {
-      prevZoomRef.current = zoom;
-      setIsZooming(true);
-      clearTimeout(zoomTimeoutRef.current);
-      zoomTimeoutRef.current = setTimeout(() => setIsZooming(false), 300);
-    }
-  }, [zoom]);
-
-  // ── Detect PIXEL-SCALE changes and disable the loco transition then too ──
-  // `isZooming` above only catches a manual mouse-wheel zoom (it watches the
-  // `zoom` state). But xS()/yS() also change whenever:
-  //   - the container is resized (ResizeObserver → size → GW/GH change), or
-  //   - the auto-fit domain widens/narrows (fitMin/fitMax → domainSpan
-  //     change) as the loco approaches/passes the profile edge, even though
-  //     `zoom` itself is still 1.
-  // When that happens, xS(monoDist)/yS(speed) suddenly map to a DIFFERENT
-  // pixel scale than the previous render. The marker's <g> still has its
-  // 1.6s CSS transition, so the browser tweens between the old translate
-  // (old scale) and new translate (new scale) as if it were a normal
-  // movement — visibly dragging the icon off the trail/curve for up to
-  // 1.6s, even though the trail path and the frozen brake-event dots are
-  // redrawn instantly and are always correct. Comparing GW/GH/domainSpan
-  // across renders and forcing an instant (no-transition) snap on the
-  // render where they actually change fixes this without touching the
-  // normal smooth glide between ordinary position updates.
-  // NOTE: this must be a plain value computed during render (comparing
-  // against a ref snapshot of the LAST render), not state-set-in-an-effect —
-  // an effect only runs after commit, which would mean the very render
-  // whose scale changed (the one that needs the instant snap) still used
-  // the old "no change" transition, i.e. exactly the one-render-late bug
-  // this fix exists to close.
-  const scaleSnapshotRef = useRef({ GW, GH, domainSpan, isUpLine });
-  const prevScale = scaleSnapshotRef.current;
-  const SCALE_EPS = 0.5; // px — ignores sub-pixel ResizeObserver noise
-  const scaleJustChanged =
-    Math.abs(prevScale.GW - GW) > SCALE_EPS ||
-    Math.abs(prevScale.GH - GH) > SCALE_EPS ||
-    Math.abs(prevScale.domainSpan - domainSpan) > SCALE_EPS ||
-    prevScale.isUpLine !== isUpLine;
-  scaleSnapshotRef.current = { GW, GH, domainSpan, isUpLine };
-
   useEffect(() => {
     const el = svgRef.current;
     if (!el) return;
@@ -1578,6 +1620,7 @@ function TrackChart({ layers, locos, primaryId, chainageOffset = 0, absDir = 1, 
   return (
     <div ref={wrapRef} style={{ width: "100%", height: "100%", display: "flex", flexDirection: "column", justifyContent: "center" }}>
     <style>{`
+      ${LOCO_STYLE_CSS}
       @keyframes locoWheelSpin { to { transform: rotate(360deg); } }
       .loco-wheel {
         transform-box: fill-box; transform-origin: center;
@@ -2883,12 +2926,8 @@ function TrackChart({ layers, locos, primaryId, chainageOffset = 0, absDir = 1, 
         const tipY = flipBelow ? cardTop - 8 : cardTop + boxH + 8;
         const anchorY = flipBelow ? iconSize * 0.45 : -iconSize * 0.7;
         return (
-          <g key={loco.locoId}
-             style={{
-               transform: `translate(${x}px, ${y}px)`,
-               transition: (isZooming || scaleJustChanged) ? "opacity 0.6s" : "transform 1.6s linear, opacity 0.6s",
-               opacity: loco.silentSec ? 0.5 : 1,   // NO SIGNAL — faded, see LOCO_STALE_MS
-             }}>
+          <LocoMotion key={loco.locoId} loco={loco} xS={xS} yS={yS} color={color}
+             opacity={loco.silentSec ? 0.5 : 1 /* NO SIGNAL — faded, see LOCO_STALE_MS */}>
             {loco.emergency > 0 && (
               <circle r={16} fill={color} opacity={0.25}>
                 <animate attributeName="r" values="12;18;12" dur="1s" repeatCount="indefinite"/>
@@ -3034,7 +3073,7 @@ function TrackChart({ layers, locos, primaryId, chainageOffset = 0, absDir = 1, 
                 })()}
               </g>
             </g>
-          </g>
+          </LocoMotion>
         );
       })}
 
@@ -3377,11 +3416,17 @@ export default function LiveTrackProfile({ apdResult, serialLog, rfidTagTable: r
     // Tier 2 — no tag table: use the loco's own RFID read. At the moment it
     // reported LAST_RFID = a tag that is in this profile's TLI layer, its
     // ABS_LOCO_LOC ≈ that tag's real location, so (abs − tag local dist) is
-    // the offset. Latched at the tag read (anchor.absAtTag), not live.
+    // the offset. Latched once per run, at the FIRST tag read in this profile
+    // (calibAnchor). Re-latching at every tag shifted the whole chart by up to
+    // hundreds of metres, because a tag is often first reported late, after a
+    // radio gap, when the loco has already run well past it.
     // Tier 3 — nothing to match against: treat the loco's first ABS_LOCO_LOC
     // as 0 m so the icon still appears and moves (relative movement only).
     const lp = locos[primaryId] || Object.values(locos)[0];
-    if (lp?.anchor?.absAtTag != null) return { offset: lp.anchor.absAtTag - absDir * lp.anchor.tagDist, absDir, calibrated: true, mode: "anchor" };
+    if (lp?.calibAnchor) {
+      const t = tli.find(x => x.tagId === lp.calibAnchor.tagId);
+      if (t) return { offset: lp.calibAnchor.absAt - absDir * t.cumDist, absDir, calibrated: true, mode: "anchor" };
+    }
     if (lp?.firstAbs != null) return { offset: lp.firstAbs, absDir, calibrated: true, mode: "relative" };
     return { offset: 0, absDir, calibrated: false, mode: "none" };
   }, [tagLocationMap, activeLayers, locos, primaryId]);
@@ -3609,6 +3654,10 @@ export default function LiveTrackProfile({ apdResult, serialLog, rfidTagTable: r
         const hiddenDuringGap = existing ? hiddenNow - (existing.lastSeenHiddenAccum || 0) : 0;
         const activeElapsed = existing ? (Date.now() - existing.lastSeen) - Math.max(0, hiddenDuringGap) : Infinity;
         const isNewRun = !existing || activeElapsed > RUN_GAP_MS;
+        let calibAnchor = isNewRun ? null : (existing?.calibAnchor || null);
+        if (!calibAnchor && dec.lastRfid != null && dec.absLoc != null && tliList.some(t => t.tagId === dec.lastRfid)) {
+          calibAnchor = { tagId: dec.lastRfid, absAt: dec.absLoc };
+        }
 
         // ── Outlier rejection ─────────────────────────────────────────
         // A single noisy/erroneous ABS_LOCO_LOC packet used to get baked
@@ -3754,7 +3803,7 @@ export default function LiveTrackProfile({ apdResult, serialLog, rfidTagTable: r
         // Access Request), kept separately so the bottom strip can show both
         // side by side instead of flipping between them on every packet.
         const pkts = { ...(existing?.pkts || {}), [dec.pktType]: { ...dec, at: Date.now() } };
-        next[id] = { ...dec, anchor, firstAbs, manualOffset, distAbs, monoAbs, rawHistory, trail, brakeEvents, brakeSeen, brakePrev, procSeen: nextProcSeen, colorIdx: colorIdxRef.current[id], lastSeen: Date.now(), lastSeenHiddenAccum: hiddenNow, flashAt, rfidFlashAt, pkts };
+        next[id] = { ...dec, anchor, calibAnchor, firstAbs, manualOffset, distAbs, monoAbs, rawHistory, trail, brakeEvents, brakeSeen, brakePrev, procSeen: nextProcSeen, colorIdx: colorIdxRef.current[id], lastSeen: Date.now(), lastSeenHiddenAccum: hiddenNow, flashAt, rfidFlashAt, pkts };
         changed = true;
       });
       return changed ? next : prev;

@@ -136,7 +136,7 @@ def _detect_wsl() -> bool:
 
 IS_WSL: bool = _detect_wsl()
 
-from decoder import decode_all_packets
+from decoder import decode_all_packets, LOCO_MODE_MAP
 
 # ── SVK SIM bridge (C shared library via ctypes) ───────────────────────────
 try:
@@ -155,6 +155,43 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+class _EngineTokenGuard:
+    """Multi-user PINJ: an engine started by the hub (hub.py) gets PINJ_ENGINE_TOKEN and then answers
+    only requests that carry it (header X-PINJ-Engine-Token) — so nobody can skip the login by calling
+    an engine port directly. Without PINJ_ENGINE_TOKEN (PINJ run on its own) nothing changes."""
+
+    def __init__(self, inner, token: str):
+        self.inner = inner
+        self.token = token.encode()
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] in ("http", "websocket"):
+            sent = dict(scope.get("headers") or []).get(b"x-pinj-engine-token", b"")
+            if not hmac.compare_digest(sent, self.token):
+                if scope["type"] == "http":
+                    await send({"type": "http.response.start", "status": 403,
+                                "headers": [(b"content-type", b"application/json")]})
+                    await send({"type": "http.response.body", "body": b'{"detail":"Use PINJ through the login page."}'})
+                else:
+                    await send({"type": "websocket.close", "code": 4403})
+                return
+            # the hub adds X-PINJ-Local only when the browser runs on the server PC itself
+            _REQ_LOCAL.set(dict(scope.get("headers") or []).get(b"x-pinj-local", b"") == b"1")
+        await self.inner(scope, receive, send)
+
+
+import contextvars
+import hmac
+import os as _os_env
+
+import agent_link as _agent
+# True while serving a request from a browser on the server PC (or PINJ run on its own, without the hub)
+_REQ_LOCAL = contextvars.ContextVar("pinj_req_local", default=not _agent.HUB_MODE)
+
+if _os_env.environ.get("PINJ_ENGINE_TOKEN"):
+    app.add_middleware(_EngineTokenGuard, token=_os_env.environ["PINJ_ENGINE_TOKEN"])
 
 # ── Session state ────────────────────────────────────────────────────────────
 live_history: deque = deque(maxlen=3000)   # = the largest LIVE table size (⚙ Settings → LIVE)
@@ -309,10 +346,12 @@ class SerialConfigPayload(BaseModel):
 class SerialResumePayload(BaseModel):
     """Optional body for /svk/serial_resume — a replacement storyboard."""
     csv: Optional[str] = None
+    name: Optional[str] = None   # its file name — added to the .log file name at the end of the run
 
 
 class SerialTransmitPayload(BaseModel):
     csv:      str
+    name:     Optional[str] = None   # storyboard file name — part of the .log file name
     loop:     bool = False
     radio_id: int  = 1   # 1 (Radio1) or 2 (Radio2) — sets the §C.3.2.12
                          # OTA Start-of-Frame prefix (0xF1/0xF2 0xA5 0xC3)
@@ -321,7 +360,9 @@ class SerialTransmitPayload(BaseModel):
 
 
 # ── Config file ──────────────────────────────────────────────────────────────
-_SERIAL_CFG_PATH = _os.path.join(_os.path.dirname(__file__), "serial_config.json")
+# Multi-user PINJ: the hub (hub.py) starts one engine per user and points PINJ_SERIAL_CFG at that
+# user's own file (data/benches/<user>/serial_config.json); run on its own it uses the one next to main.py.
+_SERIAL_CFG_PATH = _os.environ.get("PINJ_SERIAL_CFG") or _os.path.join(_os.path.dirname(__file__), "serial_config.json")
 
 _DEFAULT_SERIAL_CFG: dict = {
     "mode":            "sim_loopback",   # starts in simulation/loopback mode
@@ -472,6 +513,14 @@ PTT_KEYDOWN_DELAY_S = 0.15   # let the last byte clear the air before un-keying
 PTT_RX_SETTLE_S     = 0.05   # brief RX turnaround after PTT drops
 
 
+def _secs_to_next_tdma_epoch() -> float:
+    """Seconds until the next 2-second TDMA boundary on the wall clock — the
+    same pacing the UDP path uses (sleep_until_next_2s_boundary in the C layer).
+    Bursts must start on these boundaries: waiting a fixed 2 s AFTER the PTT
+    delays gave a 2.38 s period, which skipped a FRAME_NUM about every 12 s."""
+    return 2.0 - (time.time() % 2.0)
+
+
 def _set_ptt(ser, active: bool, is_sim: bool, rts_enabled: int = 1) -> None:
     """Drive the RTS line (Guardian TX-key/PTT) HIGH (active=True) or LOW.
     No-op on DummySerialPort / any hardware error (best-effort, like every
@@ -540,7 +589,8 @@ def verify_pkt_crc(hex_str: str):
 # plain-text .log file under _TEST_LOG_DIR, named with today's date and a
 # monotonically increasing test sequence number so successive runs never
 # collide or overwrite each other.
-_TEST_LOG_DIR = "/home/vinoth/Projects/DecodeX/logs"
+_TEST_LOG_DIR = (_os.environ.get("PINJ_LOG_DIR")                       # hub: logs/<user>
+                 or _os.path.join(_os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))), "logs"))
 
 # pkt_type → short code, for the log file only. Mirrors SvkSim.jsx's
 # PKT_TYPE_META abbreviations — keep the two in sync if a new pkt_type is
@@ -561,7 +611,7 @@ def _next_test_seq() -> int:
         _os.makedirs(_TEST_LOG_DIR, exist_ok=True)
         best = 0
         for name in _os.listdir(_TEST_LOG_DIR):
-            m = _re.match(r"^svk_test_\d{8}_(\d{4,})\.log$", name)
+            m = _re.match(r"^(?:svk|pinj)_test_\d{8}_(\d{4,})(?:_.*)?\.log$", name)   # old svk_test_ / new pinj_test_ logs, with or without a storyboard name
             if m:
                 best = max(best, int(m.group(1)))
         return best + 1
@@ -569,11 +619,49 @@ def _next_test_seq() -> int:
         return 1
 
 
-def _open_test_log(kind: str):
+def _story_slug(name) -> str:
+    """Storyboard file name → a file-name-safe part of the .log name ('' when there is none,
+    e.g. a pasted storyboard): extension dropped, spaces / symbols → '_', at most 100 characters
+    (a longer name is shortened in the middle with '~', so its start and its end — L2S / AccReq, loco ID — stay).
+    "1_NOVA StoryBoard - SKP_StationaryLoco_L2S_188408.csv" → "1_NOVA_StoryBoard-SKP_StationaryLoco_L2S_188408" """
+    try:
+        if not name:
+            return ""
+        base = _os.path.splitext(_os.path.basename(str(name).replace("\\", "/")))[0]
+        s = _re.sub(r"[^A-Za-z0-9.\-]+", "_", base)
+        s = _re.sub(r"_*-_*", "-", s).strip("._-")
+        return s if len(s) <= 100 else s[:50].rstrip("._-") + "~" + s[-49:].lstrip("._-")
+    except Exception:
+        return ""
+
+
+def _story_log_target(path, names) -> str:
+    """The .log path a session ends with (renamed at STOP / end of run): the LAST storyboard that
+    ran is added — pinj_test_<date>_<NNNN>_<last storyboard>.log (storyboard 1 when it was the only
+    one). A pasted storyboard (no file name) falls back to the latest one that had a name.
+    Unchanged when there is no name at all, or that name is too long / already exists. Never raises."""
+    try:
+        if not path:
+            return path
+        slug = next((s for s in (_story_slug(n) for n in reversed(names or [])) if s), "")
+        if not slug:
+            return path
+        stem, ext = _os.path.splitext(path)
+        new = f"{stem}_{slug}{ext}"
+        if len(_os.path.basename(new)) > 240 or _os.path.exists(new):
+            return path
+        return new
+    except Exception:
+        return path
+
+
+def _open_test_log(kind: str, story_name=None, name_now: bool = False):
     """
     Open a new per-session .log file for a TRANSMIT STORYBOARD run.
-    Filename: svk_test_<YYYYMMDD>_<NNNN>.log — date + sequence number, per
-    the requested naming ("date, event test count").
+    Filename: pinj_test_<YYYYMMDD>_<NNNN>.log — date + sequence number, per
+    the requested naming ("date, event test count"). The storyboard's file name is written
+    inside; it is added to the file name at the end of the run (_story_log_target), or at once
+    with name_now=True (UDP/HTTP transmit — a single storyboard that runs to completion).
 
     Best-effort: on ANY failure (dir not creatable/writable, disk full,
     etc.) returns (None, None, seq) rather than raising — a broken log
@@ -581,13 +669,15 @@ def _open_test_log(kind: str):
     """
     seq = _next_test_seq()
     date_str = _ist_now().strftime("%Y%m%d")
-    fname = f"svk_test_{date_str}_{seq:04d}.log"
+    slug = _story_slug(story_name) if name_now else ""
+    fname = f"pinj_test_{date_str}_{seq:04d}" + (f"_{slug}" if slug else "") + ".log"
     path = _os.path.join(_TEST_LOG_DIR, fname)
     try:
         _os.makedirs(_TEST_LOG_DIR, exist_ok=True)
         fh = open(path, "w", encoding="utf-8")
         fh.write(f"# DecodeX SVK SIM test log — {kind.upper()} — "
                   f"started {_ist_now().strftime('%Y-%m-%d %H:%M:%S')} IST\n")
+        fh.write(f"# storyboard 1: {story_name or '(pasted, no file name)'}\n")
         fh.write("# " + _log_header_line() + "\n")
         fh.flush()
         return fh, path, seq
@@ -877,6 +967,16 @@ def _open_serial_port(cfg: dict):
 
     if mode == "sim_loopback":
         return DummySerialPort(cfg), "sim_loopback"
+
+    # Multi-user PINJ: the user's own modem, through the PINJ Modem Agent on their PC
+    if device.upper().startswith(_agent.AGENT_PREFIX):
+        try:
+            return _agent.RemoteSerialPort(cfg), "agent"
+        except Exception as exc:                         # noqa: BLE001
+            return DummySerialPort(cfg), f"sim_loopback (modem on your PC not available: {exc})"
+    if _agent.HUB_MODE and not _REQ_LOCAL.get():
+        return DummySerialPort(cfg), (f"sim_loopback ({device} is a port of the PINJ server PC — from another PC, "
+                                      f"start the PINJ Modem Agent and pick your modem as AGENT:…)")
 
     if not SERIAL_AVAILABLE:
         return DummySerialPort(cfg), "sim_loopback (pyserial not installed)"
@@ -1468,6 +1568,7 @@ class EncodeCsvPayload(BaseModel):
 
 class TransmitCsvPayload(BaseModel):
     csv:       str
+    name:      Optional[str] = None   # storyboard file name — part of the .log file name
     dest_ip:   str  = "127.0.0.1"
     dest_port: int  = 12345
     loop:      bool = False
@@ -1701,7 +1802,7 @@ async def svk_transmit_storyboard_csv(payload: TransmitCsvPayload):
         # Apply MA table route1 overrides to CSV before encoding
         patched_csv = _apply_ma_route1_and_authtype_to_csv(payload.csv)
         preview = _svk_encode_csv(patched_csv, payload.radio_id)
-        _log_fh, _log_path, _log_seq = _open_test_log("udp")
+        _log_fh, _log_path, _log_seq = _open_test_log("udp", payload.name, name_now=True)
         _log_note(_log_fh,
             f"dest={payload.dest_ip}:{payload.dest_port} radio={payload.radio_id} "
             f"loop={payload.loop} -- NOTE: hex/timestamps below are a "
@@ -1760,6 +1861,7 @@ async def svk_transmit_storyboard_csv(payload: TransmitCsvPayload):
                 _log_fh.close()
             except Exception:
                 pass
+            _agent.save_log_on_agent(_log_path)            # a copy on the tester's own PC (PINJ Modem Agent)
 
 
 # ── POST /svk/transmit_stop ───────────────────────────────────────────────
@@ -2486,6 +2588,125 @@ def _update_live_ma_from_l2s(decoded: dict):
         return None
 
 
+# ── Loco storyboard: profile acknowledge (REF_PROF_ID → LAST_REF_PROFILE_NUM) ──
+# While a loco (L2S) storyboard is transmitted over serial, the loco acknowledges
+# each track profile it receives: the REF_PROF_ID of every received Station→Onboard
+# (C.4.2, PKT_TYPE 9) packet — profile or MA-only, as it comes — is written into the
+# LAST_REF_PROFILE_NUM of every Onboard→Station (C.4.3, PKT_TYPE 10) packet sent
+# afterwards for the loco it was addressed to (DEST_LOCO_ID; 0 = all locos).
+# Reset at the start of each serial transmission.
+_live_ref_prof: dict = {}           # {DEST_LOCO_ID: {"value", "stn", "frame"}}
+
+# C.4.3 bit layout (decode_onboard_to_station() in decoder.py):
+#   PKT_TYPE 4 · PKT_LENGTH 7 · FRAME_NUM 17 · SOURCE_LOCO_ID 20 (bit 28) ·
+#   VERSION 3 · ABS_LOCO_LOC 23 · L_DOUBTOVER 9 · L_DOUBTUNDER 9 · TRAIN_INT 2 ·
+#   TRAIN_LENGTH 11 · TRAIN_SPEED 9 · MOVEMENT_DIR 2 · EMERGENCY_STATUS 3 ·
+#   LOCO_MODE 4 · LAST_RFID_TAG 10 · TAG_DUP 1 · TAG_LINK_INFO 3 · TIN 9 ·
+#   Brake_Applied 3 · NEW_MA_REPLY 2 · LAST_REF_PROFILE_NUM 4 (bit 151)
+_L2S_LOCO_ID_BIT, _L2S_LAST_REF_PROF_BIT = 28, 151
+
+
+def _update_ref_prof_from_s2l(decoded: dict):
+    """Remember REF_PROF_ID of a received C.4.2 (profile or MA-only) for its DEST_LOCO_ID.
+    Returns (loco, old, new) when the value for that loco changed, else None. Never raises."""
+    try:
+        if not decoded or decoded.get("error"):
+            return None
+        f = {(x.get("Field") or "").strip(): x.get("Decimal Value") for x in decoded.get("fields", [])}
+        if "REF_PROF_ID" not in f or "DEST_LOCO_ID" not in f or "LAST_REF_RFID" not in f:
+            return None                     # not a Station→Onboard regular packet
+        loco, value = int(f["DEST_LOCO_ID"]), int(f["REF_PROF_ID"])
+        old = _live_ref_prof.get(loco, {}).get("value")
+        _live_ref_prof[loco] = {"value": value, "stn": f.get("SOURCE_STN_ILC_IBS_ID"), "frame": f.get("FRAME_NUM")}
+        return (loco, old, value) if old != value else None
+    except Exception:
+        return None
+
+
+def _patch_last_ref_prof_in_hex(hex_str: str):
+    """Write the station's REF_PROF_ID into LAST_REF_PROFILE_NUM of a C.4.3 and
+    re-sync an auto-generated PKT_CRC (same rule as _patch_frame_num_in_hex()).
+    Returns (hex, note): note is None when nothing applies. Never raises."""
+    try:
+        raw = bytearray.fromhex(hex_str.strip())
+        if (raw[0] >> 4) & 0xF != 10 or len(raw) * 8 < _L2S_LAST_REF_PROF_BIT + 4 + 32:
+            return hex_str, None
+        loco = _read_bits_be(raw, _L2S_LOCO_ID_BIT, 20)
+        src = _live_ref_prof.get(loco) or _live_ref_prof.get(0)
+        if not src:
+            return hex_str, None
+        old = _read_bits_be(raw, _L2S_LAST_REF_PROF_BIT, 4)
+        new = max(0, min(15, int(src["value"])))
+        was_auto_crc = project_crc32(bytes(raw[:-4])) == int.from_bytes(raw[-4:], "big")
+        _write_bits_be(raw, _L2S_LAST_REF_PROF_BIT, 4, new)
+        if was_auto_crc:
+            raw[-4:] = project_crc32(bytes(raw[:-4])).to_bytes(4, "big")
+        note = (f"LAST_REF_PROFILE_NUM updated from station: loco {loco}, "
+                f"{old} -> {new} (REF_PROF_ID from station {src.get('stn')}, frame {src.get('frame')})")
+        return raw.hex().upper(), note
+    except Exception:
+        return hex_str, None
+
+
+# ── Loco storyboard: LOCO_MODE from the station's AUTHORITY_TYPE ──
+# The station authorises the loco's mode in the MA of its C.4.2 (AUTHORITY_TYPE,
+# Annexure C): OS → On Sight, FS → Full Supervision, SR → Staff Responsible.
+# While a loco (L2S) storyboard is transmitted over serial, the AUTHORITY_TYPE of
+# every received C.4.2 addressed to the loco (DEST_LOCO_ID; 0 = all locos) is
+# written as LOCO_MODE into every C.4.3 sent afterwards, until another arrives.
+# AUTHORITY_TYPE 0 ("Not to be used") or a C.4.2 without an MA changes nothing.
+# Reset at the start of each serial transmission.
+_AUTH_TYPE_TO_LOCO_MODE = {1: 6, 2: 4, 3: 2}     # OS → On_Sight · FS → Full_Supervision · SR → Staff_Responsible
+_L2S_LOCO_MODE_BIT = 119                          # C.4.3 LOCO_MODE (4 bits) — layout above
+_live_loco_mode: dict = {}          # {DEST_LOCO_ID: {"auth", "mode", "stn", "frame"}}
+
+
+def _update_loco_mode_from_s2l(decoded: dict):
+    """Remember the LOCO_MODE authorised by a received C.4.2's AUTHORITY_TYPE for its
+    DEST_LOCO_ID. Returns (loco, old_auth, new_auth, mode) when it changed, else None. Never raises."""
+    try:
+        if not decoded or decoded.get("error"):
+            return None
+        f = {(x.get("Field") or "").strip(): x.get("Decimal Value") for x in decoded.get("fields", [])}
+        if "AUTHORITY_TYPE" not in f or "DEST_LOCO_ID" not in f or "LAST_REF_RFID" not in f:
+            return None                     # not a Station→Onboard regular packet with an MA
+        loco, auth = int(f["DEST_LOCO_ID"]), int(f["AUTHORITY_TYPE"])
+        mode = _AUTH_TYPE_TO_LOCO_MODE.get(auth)
+        if mode is None:
+            return None                     # 0 = "Not to be used" — keep the last authority
+        old = _live_loco_mode.get(loco, {}).get("auth")
+        _live_loco_mode[loco] = {"auth": auth, "mode": mode, "stn": f.get("SOURCE_STN_ILC_IBS_ID"), "frame": f.get("FRAME_NUM")}
+        return (loco, old, auth, mode) if old != auth else None
+    except Exception:
+        return None
+
+
+def _patch_loco_mode_in_hex(hex_str: str):
+    """Write the station-authorised LOCO_MODE into a C.4.3 and re-sync an auto-generated
+    PKT_CRC (same rule as _patch_frame_num_in_hex()). Returns (hex, note): note is None
+    when nothing applies. Never raises."""
+    try:
+        raw = bytearray.fromhex(hex_str.strip())
+        if (raw[0] >> 4) & 0xF != 10 or len(raw) * 8 < _L2S_LOCO_MODE_BIT + 4 + 32:
+            return hex_str, None
+        loco = _read_bits_be(raw, _L2S_LOCO_ID_BIT, 20)
+        src = _live_loco_mode.get(loco) or _live_loco_mode.get(0)
+        if not src:
+            return hex_str, None
+        old = _read_bits_be(raw, _L2S_LOCO_MODE_BIT, 4)
+        new = int(src["mode"])
+        was_auto_crc = project_crc32(bytes(raw[:-4])) == int.from_bytes(raw[-4:], "big")
+        _write_bits_be(raw, _L2S_LOCO_MODE_BIT, 4, new)
+        if was_auto_crc:
+            raw[-4:] = project_crc32(bytes(raw[:-4])).to_bytes(4, "big")
+        note = (f"LOCO_MODE updated from station: loco {loco}, {old} ({LOCO_MODE_MAP.get(old, '?')}) -> "
+                f"{new} ({LOCO_MODE_MAP.get(new, '?')}) (AUTHORITY_TYPE {src['auth']} "
+                f"from station {src.get('stn')}, frame {src.get('frame')})")
+        return raw.hex().upper(), note
+    except Exception:
+        return hex_str, None
+
+
 def _read_bits_be(raw: bytearray, bit_pos: int, n: int) -> int:
     """Read n bits starting at bit_pos (MSB-first within each byte) as an unsigned int."""
     v = 0
@@ -2876,7 +3097,18 @@ async def svk_serial_ports():
         }
     ]
 
-    if SERIAL_AVAILABLE and _serial_list_ports_mod is not None:
+    agent = await asyncio.to_thread(_agent.agent_ports)
+    if agent.get("online"):
+        for p in agent.get("ports") or []:
+            ports.append({
+                "device":      _agent.AGENT_PREFIX + p.get("device", ""),
+                "description": f"{p.get('description') or 'serial port'} — on your PC {agent.get('hostname', '')}".strip(),
+                "hwid":        p.get("hwid", ""),
+                "sim":         False,
+                "agent":       True,
+            })
+
+    if SERIAL_AVAILABLE and _serial_list_ports_mod is not None and _REQ_LOCAL.get():
         for p in _serial_list_ports_mod.comports():
             hwid = (p.hwid or "").strip()
             if hwid.lower() in ("", "n/a"):
@@ -2901,6 +3133,8 @@ async def svk_serial_ports():
         "is_wsl":            IS_WSL,
         "ports":             ports,
         "current_config":    _serial_cfg,
+        "agent":             agent,                      # multi-user PINJ: the user's PINJ Modem Agent
+        "server_ports_shown": bool(_REQ_LOCAL.get()),
     }
 
 
@@ -3091,7 +3325,7 @@ async def svk_serial_resume(payload: Optional[SerialResumePayload] = None):
         frame_map: dict = {}
         for pkt in valid:
             frame_map.setdefault(pkt["frame_num"], []).append(pkt)
-        _serial_tx_new_story = {"frames": list(frame_map.items()), "csv": payload.csv, "packets": len(valid)}
+        _serial_tx_new_story = {"frames": list(frame_map.items()), "csv": payload.csv, "packets": len(valid), "name": payload.name}
         new_info = {"frames": len(frame_map), "packets": len(valid)}
     _serial_tx_paused = False
     return {"status": "resume_requested", "new_storyboard": new_info}
@@ -3214,7 +3448,7 @@ async def svk_serial_transmit(payload: SerialTransmitPayload):
 
     All TX/RX events are pushed to /ws/serial_log subscribers.
     """
-    global _serial_tx_stop, _serial_tx_task, _live_ma, _serial_tx_paused, _serial_tx_new_story, _serial_tx_radio_id
+    global _serial_tx_stop, _serial_tx_task, _live_ma, _serial_tx_paused, _serial_tx_new_story, _serial_tx_radio_id, _live_ref_prof, _live_loco_mode
 
     if not SVK_AVAILABLE or not _SVK_ENCODE_OK:
         raise HTTPException(status_code=503,
@@ -3245,6 +3479,8 @@ async def svk_serial_transmit(payload: SerialTransmitPayload):
     # loop below saw route1 != None on its very first frame and re-encoded the
     # whole new run with the OLD route/MA until a fresh L2S tag matched.
     _live_ma = {"rfid_tag": None, "fields": {}, "updated_at": None}
+    _live_ref_prof = {}     # likewise: no REF_PROF_ID until a C.4.2 arrives in this run
+    _live_loco_mode = {}    # and no authorised LOCO_MODE until a C.4.2 with an MA arrives
 
     # Encode the NEW CSV now (outside _run) so any encode error surfaces
     # synchronously in the HTTP response before we start the task.
@@ -3274,13 +3510,14 @@ async def svk_serial_transmit(payload: SerialTransmitPayload):
     frames = list(frame_map.items())   # local snapshot — not mutated by task
     # The storyboard this session is transmitting. Replaced (not mutated) when a
     # new storyboard is swapped in on resume — see _hold_if_paused().
-    story = {"frames": frames, "csv": payload.csv, "packets": len(valid), "swaps": 0}
+    story = {"frames": frames, "csv": payload.csv, "packets": len(valid), "swaps": 0,
+             "names": [payload.name]}   # storyboard file names in order — the .log name gets them at the end
     sent_total = [0]                    # packets actually transmitted this session
 
     # Open this session's .log file now (outside _run) so its real path can
     # be returned in the synchronous HTTP response below, not just logged
     # after the fact.
-    _log_fh, _log_path, _log_seq = _open_test_log("serial")
+    _log_fh, _log_path, _log_seq = _open_test_log("serial", payload.name)
     _log_counter = [0]   # shared mutable "#n" counter across TX + RX lines
 
     async def _run():
@@ -3391,6 +3628,15 @@ async def svk_serial_transmit(payload: SerialTransmitPayload):
                             _fields_str = ", ".join(f"{k}={v}" for k, v in ma_ev["fields"].items())
                             _log_note(_log_fh,
                                 f"MA updated from tag {ma_ev['rfid_tag']}: {_fields_str}")
+                        rp = _update_ref_prof_from_s2l(batch[0])
+                        if rp:
+                            _log_note(_log_fh,
+                                f"REF_PROF_ID received from station for loco {rp[0]}: {rp[1]} -> {rp[2]} (acknowledged in LAST_REF_PROFILE_NUM)")
+                        lm = _update_loco_mode_from_s2l(batch[0])
+                        if lm:
+                            _log_note(_log_fh,
+                                f"AUTHORITY_TYPE received from station for loco {lm[0]}: {lm[1]} -> {lm[2]} "
+                                f"(LOCO_MODE {lm[3]} {LOCO_MODE_MAP.get(lm[3], '?')})")
                 except Exception:
                     pass
                 await _push({
@@ -3446,6 +3692,7 @@ async def svk_serial_transmit(payload: SerialTransmitPayload):
                     story["csv"]     = new_story["csv"]
                     story["packets"] = new_story["packets"]
                     story["swaps"]  += 1
+                    story["names"].append(new_story.get("name"))
                     n_frames = len(story["frames"])
                     await _push({"type": "serial_status", "status": "resumed", "sim": is_sim,
                                  "next_frame": 1, "total_frames": n_frames, "new_storyboard": True,
@@ -3454,6 +3701,11 @@ async def svk_serial_transmit(payload: SerialTransmitPayload):
                     _log_note(_log_fh, f"storyboard replaced while paused — new storyboard: "
                                        f"{n_frames} frames, {new_story['packets']} packets; "
                                        f"resumed at its frame 1")
+                    _log_note(_log_fh, f"storyboard {len(story['names'])}: "
+                                       f"{new_story.get('name') or '(pasted, no file name)'}"
+                                       + ("" if _story_log_target(_log_path, story["names"]) == _log_path else
+                                          f" — at the end of the run this log is renamed to "
+                                          f"{_os.path.basename(_story_log_target(_log_path, story['names']))}"))
                     return True
                 await _push({"type": "serial_status", "status": "resumed", "sim": is_sim,
                              "next_frame": next_frame_idx + 1, "total_frames": total,
@@ -3467,6 +3719,11 @@ async def svk_serial_transmit(payload: SerialTransmitPayload):
                 _original_payload_csv = story["csv"]
                 _prev_route1 = None
                 _reencoded_cache.clear()
+
+            # First burst also starts on a TDMA boundary.
+            _first_at = time.time() + _secs_to_next_tdma_epoch()
+            while not _serial_tx_stop and time.time() < _first_at:
+                await _asyncio.sleep(min(0.05, max(0.0, _first_at - time.time())))
 
             loop_flag = True
             while loop_flag:
@@ -3541,6 +3798,14 @@ async def svk_serial_transmit(payload: SerialTransmitPayload):
                         # packet types use their original storyboard values unchanged.
                         if pkt.get("pkt_type") == 9:
                             patched_hex = _patch_ma_fields_in_hex(patched_hex, _live_ma.get("fields"))
+                        # Loco storyboard: LAST_REF_PROFILE_NUM ← the station's latest REF_PROF_ID
+                        ref_prof_note = None
+                        if pkt.get("pkt_type") == 10:
+                            patched_hex, ref_prof_note = _patch_last_ref_prof_in_hex(patched_hex)
+                        # Loco storyboard: LOCO_MODE ← the mode the station's AUTHORITY_TYPE authorises
+                        loco_mode_note = None
+                        if pkt.get("pkt_type") == 10:
+                            patched_hex, loco_mode_note = _patch_loco_mode_in_hex(patched_hex)
                         raw_bytes   = bytes.fromhex(patched_hex)
 
                         # Prepend the §C.3.2.12 OTA Start-of-Frame prefix
@@ -3593,6 +3858,10 @@ async def svk_serial_transmit(payload: SerialTransmitPayload):
                                       csv_frame_num, pkt["tdma_slot"], pkt["pkt_type"],
                                       patched_hex, pkt["byte_len"], error=tx_error,
                                       direction="TX")
+                        if ref_prof_note:
+                            _log_note(_log_fh, ref_prof_note)
+                        if loco_mode_note:
+                            _log_note(_log_fh, loco_mode_note)
                         # 📡 LIVE page: decode the packet just sent (see _live_feed_serial_tx)
                         if tx_status == "ok":
                             _schedule_live_feed_serial_tx(
@@ -3609,15 +3878,16 @@ async def svk_serial_transmit(payload: SerialTransmitPayload):
                         # new storyboard can still be loaded and resumed into it.
                         swapped = await _hold_if_paused(frame_idx + 1)
                     if not is_last_frame or swapped:
-                        waited = 0.0
-                        while waited < 2.0 and not _serial_tx_stop:
-                            # Paused mid-gap: hold here, then finish the REST of
-                            # this 2 s TDMA gap after resuming — so the spacing
-                            # between bursts on air is never shorter than 2 s.
+                        _next_at = time.time() + _secs_to_next_tdma_epoch()
+                        while not _serial_tx_stop and time.time() < _next_at:
+                            # Paused mid-gap: hold here, then wait for the next
+                            # TDMA boundary after resuming.
+                            _was_paused = _serial_tx_paused
                             if await _hold_if_paused(frame_idx + 1):
                                 swapped = True
-                            await _asyncio.sleep(0.05)
-                            waited += 0.05
+                            if _was_paused:
+                                _next_at = time.time() + _secs_to_next_tdma_epoch()
+                            await _asyncio.sleep(min(0.05, max(0.0, _next_at - time.time())))
                         # RX during this gap is now handled by rx_task above,
                         # concurrently — nothing to poll here anymore.
                     if swapped:
@@ -3649,16 +3919,19 @@ async def svk_serial_transmit(payload: SerialTransmitPayload):
             except Exception:
                 pass
 
+        final_log = _story_log_target(_log_path, story["names"])
+        log_msg = f" Log: {_os.path.basename(final_log)}" if final_log else ""
         # Only push final status if WE are still the active task
         if _serial_tx_task is _owner_task:
             if _serial_tx_stop:
-                await _push({"type": "serial_status", "status": "stopped", "sim": is_sim,
-                             "message": "Transmission stopped by user."})
+                await _push({"type": "serial_status", "status": "stopped", "sim": is_sim, "log_file": final_log,
+                             "message": "Transmission stopped by user." + log_msg})
                 _log_note(_log_fh, "session stopped by user")
             else:
-                await _push({"type": "serial_status", "status": "done", "sim": is_sim,
+                await _push({"type": "serial_status", "status": "done", "sim": is_sim, "log_file": final_log,
                              "message": f"Transmission complete. {sent_total[0]} packets sent"
-                                        + (f" ({story['swaps']} storyboard change(s))." if story["swaps"] else ".")})
+                                        + (f" ({story['swaps']} storyboard change(s))." if story["swaps"] else ".")
+                                        + log_msg})
                 _log_note(_log_fh, f"session done — {sent_total[0]} packets sent"
                                    + (f", {story['swaps']} storyboard change(s)" if story["swaps"] else ""))
             _serial_tx_task = None
@@ -3668,6 +3941,13 @@ async def svk_serial_transmit(payload: SerialTransmitPayload):
                 _log_fh.close()
             except Exception:
                 pass
+        if final_log and final_log != _log_path:      # storyboard 2… names → file name, now the log is closed
+            try:
+                _os.rename(_log_path, final_log)
+            except Exception as e:
+                print(f"[LOG] rename to {final_log} failed: {e}")
+                final_log = _log_path
+        _agent.save_log_on_agent(final_log or _log_path)   # a copy on the tester's own PC (PINJ Modem Agent)
 
     _serial_tx_task = asyncio.get_event_loop().create_task(_run())
     return {
@@ -3709,3 +3989,37 @@ async def ws_serial_log(ws: WebSocket):
         pass
     finally:
         serial_log_subscribers.discard(ws)
+
+# ── PINJ pages: the built frontend (frontend/dist), served from this same port ──────────────
+# Open http://<this-pc>:8000 from any PC on the network — one address for pages, API and
+# WebSockets. Registered LAST, so every API route above wins; any other GET returns a file
+# from frontend/dist, or index.html (the app itself decides the page, e.g. /simulator).
+# The pages are built by `npm run build` in frontend/ (START_PINJ.bat does it when needed).
+import mimetypes as _mimetypes
+from fastapi.responses import FileResponse as _FileResponse, JSONResponse as _JSONResponse
+
+# Windows can map .js to text/plain in its registry, which browsers refuse for module scripts.
+for _ext, _type in ((".js", "application/javascript"), (".mjs", "application/javascript"),
+                    (".css", "text/css"), (".svg", "image/svg+xml"), (".json", "application/json"),
+                    (".mp3", "audio/mpeg"), (".wav", "audio/wav"), (".ogg", "audio/ogg"),
+                    (".m4a", "audio/mp4"), (".png", "image/png"), (".ico", "image/x-icon")):
+    _mimetypes.add_type(_type, _ext)
+
+_DIST_DIR = _os.path.join(_os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))), "frontend", "dist")
+_API_PREFIXES = ("svk/", "live/", "ws/", "decode", "health", "ingest", "docs", "openapi.json", "redoc")
+
+
+@app.get("/{full_path:path}", include_in_schema=False)
+async def _pinj_pages(full_path: str):
+    if full_path.startswith(_API_PREFIXES):
+        return _JSONResponse({"detail": "Not Found"}, status_code=404)
+    index = _os.path.join(_DIST_DIR, "index.html")
+    if not _os.path.isfile(index):
+        return _JSONResponse({"detail": "PINJ pages are not built yet: run START_PINJ.bat "
+                                        "(or `npm run build` in frontend/)."}, status_code=503)
+    if full_path:
+        root = _os.path.realpath(_DIST_DIR)
+        target = _os.path.realpath(_os.path.join(root, full_path))
+        if target.startswith(root + _os.sep) and _os.path.isfile(target):
+            return _FileResponse(target)
+    return _FileResponse(index, headers={"Cache-Control": "no-cache"})

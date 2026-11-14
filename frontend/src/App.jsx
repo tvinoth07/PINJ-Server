@@ -1,9 +1,10 @@
 import { useState, useRef, useCallback, useEffect, useMemo } from "react";
+import { API_BASE, WS_BASE } from "./apiBase";
 import SvkSim from "./SvkSim";
-import DmiView, { createDmiKeeper, mergeKept } from "./DmiPanel";
+import DmiView, { createDmiKeeper, mergeKept, buildDmi, dmiLocoIds, createVoiceCueTracker } from "./DmiPanel";
 import LiveStrip from "./LiveStrip";
 import LiveTrackProfile from "./LiveTrackProfile";
-import { appSettingsStore, tagTableStore, useStore, SettingsDialog, AboutDialog, AppMenu, playSosAlert, playBrakeAlert, sosCategory, SOS_SOUNDS, stopAlertSound } from "./SettingsAbout";
+import { appSettingsStore, tagTableStore, useStore, SettingsDialog, AboutDialog, AppMenu, playSosAlert, playBrakeAlert, playModeAlert, playStartupSound, queueVoiceCues, soundSettingsStore, sosCategory, SOS_SOUNDS, stopAlertSound } from "./SettingsAbout";
 
 /* ═══════════════════════════════════════════════════════════════
    THEME DEFINITIONS
@@ -1961,9 +1962,10 @@ function decodeMA(rd){
   b=rd.read(4);v=b2i(b);rows.push(R("DEST_LOCO_SOS",4,b,v,sos[v]||`Rsv(${v})`,"ma"));
   b=rd.read(2);v=b2i(b);rows.push(R("TRAIN_SECTION_TYPE",2,b,v,{0:"Station Sec",1:"Absolute Block",2:"Autoblock",3:"Rsv"}[v]||"?","ma"));
   b=rd.read(17);rows.push(R("CUR_SIG_INFO",17,b,b2i(b),"Signal composite (17-bit)","ma"));
-  const asp={0:"Unidentified",1:"🔴 Red",2:"🟡 Yellow",10:"🟡🟡 Dbl Yellow",11:"🟢 Green",14:"AG OFF",15:"Red+Calling-On",48:"Stop Board"};
-  b=rd.read(6);v=b2i(b);rows.push(R("CUR_SIG_ASPECT",6,b,v,asp[v]||`Code ${v}`,"ma"));
-  b=rd.read(6);v=b2i(b);rows.push(R("NEXT_SIG_ASPECT",6,b,v,v===0?"Undefined (RED)":asp[v]||`Code ${v}`,"ma"));
+  const asp={0:"Unidentified",1:"🔴 Red",2:"🟡 Yellow",10:"🟡🟡 Dbl Yellow",11:"🟢 Green",14:"AG OFF",15:"Red+Calling-On",24:"Stop Board"};
+  const aspTxt=v=>asp[v]||(v>=32&&v<=63?`🟡 Yellow + Stencil Route ${v-31}`:`Code ${v}`);   // Annexure-C Amdt-10
+  b=rd.read(6);v=b2i(b);rows.push(R("CUR_SIG_ASPECT",6,b,v,aspTxt(v),"ma"));
+  b=rd.read(6);v=b2i(b);rows.push(R("NEXT_SIG_ASPECT",6,b,v,v===0?"Undefined (RED)":aspTxt(v),"ma"));
   b=rd.read(15);v=b2i(b);rows.push(R("APPR_SIG_DIST",15,b,v,`${v} m from ref RFID`,"ma"));
   b=rd.read(2);const authType=b2i(b);rows.push(R("AUTHORITY_TYPE",2,b,authType,AUTHORITY_MAP[authType]||"?","ma"));
   if(authType===1){b=rd.read(6);v=b2i(b);rows.push(R("AUTHORIZED_SPEED",6,b,v,spd(v),"ma"));}
@@ -2803,7 +2805,7 @@ const SPEC_ANNOTATIONS = {
   "AUTHORITY_TYPE":     { range:"2-bit", page:"C.4.2", note:"00=not used, 01=OS(On-Sight), 10=FS(Full Supervision), 11=SR(Staff Responsible)." },
   "AUTHORIZED_SPEED":   { range:"1–50 (×5kmph); 62=8kmph night", page:"C.4.2", note:"Speed restriction for OS/SR authority. Value×5=kmph. Only valid if AUTHORITY_TYPE=01 or 11." },
   "DIST_PKT_START":     { range:"15-bit signed, metres", page:"C.4.2", note:"Signed distance from LAST_REF_RFID to packet start. Negative=supervise from rear." },
-  "CUR_SIG_ASPECT":     { range:"6-bit", page:"C.4.2", note:"1=Red, 2=Yellow, 10=Dbl Yellow, 11=Green, 15=Red+CallingOn, 48=Stop Board." },
+  "CUR_SIG_ASPECT":     { range:"6-bit", page:"C.4.2", note:"1=Red, 2=Yellow, 10=Dbl Yellow, 11=Green, 15=Red+CallingOn, 24=Stop Board, 32–63=Yellow + Stencil route 1–32 (Amdt-10)." },
   "LONGITUDE":          { range:"21-bit: deg(9b)+min(6b)+sec(6b)", page:"C.4.6", note:"GPS Longitude. First 9 bits=degrees, next 6=minutes, last 6=seconds." },
   "LATITUDE":           { range:"20-bit: deg(8b)+min(6b)+sec(6b)", page:"C.4.6", note:"GPS Latitude. First 8 bits=degrees, next 6=minutes, last 6=seconds." },
 };
@@ -3660,7 +3662,7 @@ function extractProfile(fields) {
 const PV_SIG_ASP = {
   0:"Undef", 1:"🔴 Red", 2:"🟡 Yellow",
   10:"🟡🟡 Dbl Yel", 11:"🟢 Green",
-  14:"AG OFF", 15:"🔴+C Calling-On", 48:"Stop Board",
+  14:"AG OFF", 15:"🔴+C Calling-On", 24:"Stop Board",
 };
 
 /* ── Authority type label ── */
@@ -4605,7 +4607,7 @@ function ProfileVisualizer({ result, isLight }) {
   const cards = [
     {l:"REF RFID",  v:`#${prof.refRFID??"—"}`,                                   c:"#bef264"},
     {l:"DIRECTION", v:prof.pktDir===1?"Nominal":prof.pktDir===2?"Reverse":"—",    c:"#94a3b8"},
-    {l:"SIGNAL",    v:PV_SIG_ASP[prof.curSigAsp??-1]??"—",
+    {l:"SIGNAL",    v:PV_SIG_ASP[prof.curSigAsp??-1]??(prof.curSigAsp>=32&&prof.curSigAsp<=63?`🟡 Stencil ${prof.curSigAsp-31}`:"—"),
       c:prof.curSigAsp===11?"#22c55e":prof.curSigAsp===2?"#eab308":"#ef4444"},
     {l:"AUTH SPD",  v:prof.authSpeed>0?`${prof.authSpeed} kmph`:"—",              c:PV_COLORS.ssp},
     {l:"AUTH TYPE", v:PV_AUTH[prof.authType]??"—",                                c:PV_COLORS.ma},
@@ -5189,6 +5191,7 @@ function LiveTab({ isLight }) {
   /* ── Refs ── */
   const pauseBuffer = useRef([]);
   const lastBrakeRef = useRef({});   // per source: last Brake_Applied + when it beeped
+  const lastModeRef  = useRef({});   // per loco: last LOCO_MODE (mode-change beep)
   const lastSosRef   = useRef({});   // per sender + field: last SOS value + when it alerted
   const totalRef    = useRef(0);
   const pausedRef   = useRef(false);
@@ -5196,6 +5199,9 @@ function LiveTab({ isLight }) {
   // result never depends on how many rows the LIVE list keeps (capture → identical replay)
   const dmiKeeper   = useRef(null);
   if (!dmiKeeper.current) dmiKeeper.current = createDmiKeeper();
+  const cueTracker  = useRef(null);          // 🗣 route announcements already spoken, per loco
+  if (!cueTracker.current) cueTracker.current = createVoiceCueTracker();
+  const cueSeen     = useRef(new WeakSet()); // packets the announcements have looked at (numbers restart after a clear)
   const [dmiKeepVer, setDmiKeepVer] = useState(0);
   const drainTimer  = useRef(null);
   const bottomRef   = useRef(null);
@@ -5296,6 +5302,19 @@ function LiveTab({ isLight }) {
       return;
     }
 
+    // 🔁 Mode-change beep (⚙ → 🔊 SOUND → MODE CHANGE): a loco's LOCO_MODE (C.4.3 / C.4.6)
+    // differs from its previous packet. Brake beeps / SOS below take over (higher priority).
+    if ([10, 13].includes(Number(pkt.packet_type_value))) {
+      const loco = fv("SOURCE_LOCO_ID");
+      const mf = fields.find(f => (f.Field||"").trim()==="LOCO_MODE");
+      if (loco > 0 && mf) {
+        const mode = Number(mf["Decimal Value"]);
+        const last = lastModeRef.current[loco];
+        if (last != null && mode !== last) playModeAlert();
+        lastModeRef.current[loco] = mode;
+      }
+    }
+
     // 🛑 Brake beep (⚙ → 🔊 SOUND → brake beeps): Brake_Applied 2 NSB · 3 FSB
     // · 4 EB. Beeps on a new brake application per loco, and again every 10 s
     // while the same brake stays applied (packets keep arriving every 2 s).
@@ -5383,7 +5402,7 @@ function LiveTab({ isLight }) {
     const connect = () => {
       if (disposed) return;
       setWsState("connecting");
-      ws = new WebSocket("ws://localhost:8000/ws/live");
+      ws = new WebSocket(WS_BASE + "/ws/live");
       ws.onopen  = () => { if (!disposed) setWsState("open"); };
       ws.onclose = () => { if (disposed) return; setWsState("closed"); reconnectTimer = setTimeout(connect, 3000); };
       ws.onerror = () => { if (!disposed) setWsState("error"); };
@@ -5408,6 +5427,7 @@ function LiveTab({ isLight }) {
             setLivePackets([]); totalRef.current=0; setTotalReceived(0); pauseBuffer.current=[];
             seenIdxRef.current = new Set();
             dmiKeeper.current.reset(); setDmiKeepVer(v => v + 1);
+            cueTracker.current.reset();
           }
         } catch(_){}
       };
@@ -5483,11 +5503,27 @@ function LiveTab({ isLight }) {
     seenIdxRef.current = new Set(); atBottomRef.current = true; setAtBottom(true);
     setShowClearRange(false); setConfirmClearAll(false); setClearFrom(""); setClearTo("");
     dmiKeeper.current.reset(); setDmiKeepVer(v => v + 1);
+    cueTracker.current.reset();
     if (drainTimer.current) { clearInterval(drainTimer.current); drainTimer.current=null; }
-    await fetch("http://localhost:8000/live/clear",{method:"POST"}).catch(()=>{});
+    await fetch(API_BASE + "/live/clear",{method:"POST"}).catch(()=>{});
   };
 
   const dmiPackets = useMemo(() => mergeKept(livePackets, dmiKeeper.current.packets()), [livePackets, dmiKeepVer]);
+
+  // 🗣 Route announcements (⚙ → 🔊 SOUND): each new loco packet — same figures as the DMI, whichever
+  // view is on screen. This page stays mounted, so they also sound on 🧩 SVK SIM. History re-sent
+  // on connect stays silent.
+  useEffect(() => {
+    const fresh = livePackets.filter(p => !cueSeen.current.has(p));
+    if (!fresh.length) return;
+    fresh.forEach(p => cueSeen.current.add(p));
+    const snd = soundSettingsStore.get();
+    if (!snd.enabled || !snd.cuesEnabled) return;
+    const tagLoc = Object.fromEntries((tagTableStore.get().tags || []).map(t => [t.id, t.loc]));
+    dmiLocoIds(fresh.filter(p => !p._isHistory)).forEach(id => {
+      queueVoiceCues(cueTracker.current.update(buildDmi(dmiPackets, id, Date.now(), tagLoc), snd.cueSignalRepeatS * 1000, snd.cueProfileRepeatS * 1000));
+    });
+  }, [dmiPackets]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // 🗺 PROFILE = the SVK SIM "● LIVE MA (ON WIRE)" track view, fed with the LIVE packets as its
   // serial log: station packets → "tx", loco C.4.3 / C.4.6 → "rx". One event object per packet
@@ -5788,7 +5824,7 @@ function LiveTab({ isLight }) {
           })()}
         </div>
         <span style={{marginLeft:"auto",fontSize:9,color:"var(--text-muted)",fontFamily:"var(--font-mono)"}}>
-          External → <span style={{color:"var(--cyan)"}}>POST localhost:8000/ingest</span>
+          External → <span style={{color:"var(--cyan)"}}>POST {API_BASE}/ingest</span>
         </span>
         <button onClick={()=>addLiveToast({
           kind:"sos",
@@ -5868,11 +5904,11 @@ function LiveTab({ isLight }) {
           {filtered.length===0 ? (
             <div style={{display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",height:"100%",gap:14,color:"var(--text-muted)",fontFamily:"var(--font-mono)"}}>
               <span style={{fontSize:36,animation:wsState==="open"?"pulse-amber 2s infinite":"none"}}>📡</span>
-              <span style={{fontSize:13}}>{wsState==="open"?"Waiting for packets…":"Connecting to ws://localhost:8000/ws/live"}</span>
+              <span style={{fontSize:13}}>{wsState==="open"?"Waiting for packets…":`Connecting to ${WS_BASE}/ws/live`}</span>
               <div style={{fontSize:10,color:"var(--text-dim)",textAlign:"center",lineHeight:1.9}}>
                 From Packet Simulator: <span style={{color:"var(--green)"}}>{window.location.host}/simulator</span><br/>
                 From SVK SIM: UDP / HTTP and serial TX / RX packets appear here automatically<br/>
-                From external tool: <span style={{color:"var(--cyan)"}}>POST localhost:8000/ingest</span>
+                From external tool: <span style={{color:"var(--cyan)"}}>POST {API_BASE}/ingest</span>
               </div>
             </div>
           ) : (
@@ -5885,7 +5921,7 @@ function LiveTab({ isLight }) {
 
       {/* Footer */}
       <div style={{borderTop:`1px solid var(--border)`,padding:"4px 14px",display:"flex",gap:14,fontSize:9,color:"var(--text-muted)",fontFamily:"var(--font-mono)",background:"var(--footer-bg)",flexShrink:0}}>
-        <span>WS: <span style={{color:wsColor}}>ws://localhost:8000/ws/live</span></span>
+        <span>WS: <span style={{color:wsColor}}>{WS_BASE}/ws/live</span></span>
         <span>Buffer: <span style={{color:"var(--amber)"}}>{MAX_ROWS} rows max</span></span>
         <span style={{marginLeft:"auto"}}>Sources: SVK SIM UDP/HTTP · serial TX · serial RX · <span style={{color:"var(--green)"}}>{window.location.host}/simulator</span> · POST /ingest</span>
       </div>
@@ -6831,7 +6867,8 @@ function PinjHomeScene({ onSampleC46, onSampleC42, still = false }) {
       </svg>
 
       {/* ── title ── */}
-      <div style={{ position: "absolute", left: 0, right: 0, top: 12, zIndex: 2, display: "flex", flexDirection: "column", alignItems: "center", gap: 3, pointerEvents: "none" }}>
+      {/* top 64: the page's top bar floats over this scene (52 px), the title sits just below it */}
+      <div style={{ position: "absolute", left: 0, right: 0, top: 64, zIndex: 2, display: "flex", flexDirection: "column", alignItems: "center", gap: 3, pointerEvents: "none" }}>
         <div style={{ fontFamily: "var(--font-display)", fontSize: 34, letterSpacing: "0.16em", color: "var(--ph-title)", lineHeight: 1, textShadow: "0 2px 18px rgba(0,0,0,0.8)" }}>
           <span style={{
             background: "linear-gradient(90deg, var(--ph-amber), var(--ph-amber-2), var(--ph-cyan), var(--ph-amber-2), var(--ph-amber))", backgroundSize: "300% auto",
@@ -7460,6 +7497,8 @@ export default function App() {
   const crcResizeRef = useRef(null);
   const appSettings  = useStore(appSettingsStore);
   const [dialog, setDialog] = useState(null);        // null | "settings" | "about" (top bar, every page)
+  // the PINJ home scene (nothing decoded, not LIVE / SVK SIM): the top bar floats over the picture
+  const homeView = activeTab !== "live" && activeTab !== "svksim" && results.length === 0;
   useEffect(() => {
     const onKey = e => {
       if (e.key === "Escape" && dialog) { setDialog(null); return; }
@@ -7483,42 +7522,16 @@ export default function App() {
 
   // Backend health check
   useEffect(() => {
-    fetch("http://localhost:8000/health", { signal: AbortSignal.timeout(1500) })
+    fetch(API_BASE + "/health", { signal: AbortSignal.timeout(1500) })
       .then(r=>r.json()).then(()=>setBackendOk(true)).catch(()=>setBackendOk(false));
   }, []);
 
   // ── Boot sound: plays once when the app loads ──────────────────────────
   useEffect(() => {
     if (!appSettingsStore.get().bootSound) return;      // ⚙ Settings → General → start-up sound
+    // your recording public/sounds/startup.* if it is there, else the chime (SettingsAbout.jsx)
     const playBoot = () => {
-      try {
-        const ctx = new (window.AudioContext || window.webkitAudioContext)();
-        const tone = (freq, start, dur, type = "sawtooth", gain = 0.15) => {
-          const osc = ctx.createOscillator();
-          const g   = ctx.createGain();
-          osc.type = type;
-          osc.frequency.setValueAtTime(freq, start);
-          g.gain.setValueAtTime(0, start);
-          g.gain.linearRampToValueAtTime(gain, start + 0.01);
-          g.gain.exponentialRampToValueAtTime(0.001, start + dur);
-          osc.connect(g); g.connect(ctx.destination);
-          osc.start(start); osc.stop(start + dur);
-        };
-        const t = ctx.currentTime;
-        // Rising scan sweep
-        tone(180,  t,        0.08, "square",   0.10);
-        tone(360,  t + 0.08, 0.06, "square",   0.09);
-        tone(720,  t + 0.14, 0.06, "square",   0.11);
-        tone(1440, t + 0.20, 0.04, "square",   0.13);
-        // Deep power thud
-        tone(55,   t + 0.22, 0.20, "sine",     0.20);
-        // Sharp confirm beeps
-        tone(2200, t + 0.26, 0.07, "sine",     0.16);
-        tone(3000, t + 0.30, 0.05, "sine",     0.12);
-        // Final warm power-up hum
-        tone(440,  t + 0.34, 0.30, "sawtooth", 0.07);
-        tone(880,  t + 0.36, 0.25, "sawtooth", 0.05);
-      } catch (_) { /* AudioContext unavailable */ }
+      playStartupSound();
       document.removeEventListener("pointerdown", playBoot);
     };
 
@@ -7598,7 +7611,7 @@ export default function App() {
     if (!packets) { setStatus({t:"error",m:"Could not parse input — check JSON format."}); return; }
     setLoading(true); setStatus(null);
     try {
-      const res = await fetch("http://localhost:8000/decode", {
+      const res = await fetch(API_BASE + "/decode", {
         method:"POST", headers:{"Content-Type":"application/json"},
         body:JSON.stringify({packets}), signal:AbortSignal.timeout(8000),
       });
@@ -7944,7 +7957,7 @@ export default function App() {
 
     let normalized = null;
     try {
-      const res = await fetch("http://localhost:8000/decode", {
+      const res = await fetch(API_BASE + "/decode", {
         method:"POST", headers:{"Content-Type":"application/json"},
         body: JSON.stringify({ packets: reqPkts }), signal: AbortSignal.timeout(30000),
       });
@@ -8032,15 +8045,16 @@ export default function App() {
 
       <div style={{
         display:"grid",
-        gridTemplateRows: inputOpen && activeTab !== "live" && activeTab !== "svksim" ? "52px 1fr 220px" : "52px 1fr",
+        /* home page: the top bar floats over the scene (no row of its own); other pages keep a slim 52 px bar */
+        gridTemplateRows: (homeView ? "0px 1fr" : "52px 1fr") + (inputOpen && activeTab !== "live" && activeTab !== "svksim" ? " 220px" : ""),
         gridTemplateColumns: "1fr",
         height:"100vh", width:"100vw", overflow:"hidden",
         transition:"grid-template-rows 0.3s ease",
         position:"relative", zIndex:1,
       }}>
-        {dialog === "settings" && (
+        {dialog?.startsWith("settings") && (
           <SettingsDialog onClose={() => setDialog(null)} isLight={isLight} setIsLight={setIsLight}
-            initialTab={activeTab === "live" ? "live" : activeTab === "svksim" ? "svksim" : results.length ? "decoder" : "general"} />
+            initialTab={dialog.includes(":") ? dialog.split(":")[1] : activeTab === "live" ? "live" : activeTab === "svksim" ? "svksim" : results.length ? "decoder" : "general"} />
         )}
         {dialog === "about" && (
           <AboutDialog onClose={() => setDialog(null)} page={activeTab} packetTypes={PKT_META} isLight={isLight}
@@ -8048,7 +8062,8 @@ export default function App() {
         )}
 
         {/* ══ TOP BAR — KAVACH RAILWAY COMMAND CENTRE ══════════════ */}
-        <div className="kv-topbar" style={{ gridColumn:1, display:"flex", alignItems:"center", gap:10, padding:"0 14px", zIndex:10, height:52 }}>
+        <div className={"kv-topbar" + (homeView ? " kv-topbar-float" : "")} style={{ gridColumn:1, display:"flex", alignItems:"center", gap:10, padding:"0 14px", zIndex:10, height:52,
+          ...(homeView ? { position:"absolute", top:0, left:0, right:0, zIndex:30 } : {}) }}>
 
           {/* ── Company brand: NOVA (cube mark + wordmark) ──
               Images live in frontend/public/ (served from the site root).
@@ -8063,41 +8078,10 @@ export default function App() {
               <img src="/nova-mark.png" alt="" draggable={false} className="kv-nova-logo-mark" />
             </span>
             <span className="kv-nova-logo-wordwrap">
-              <img src={isLight ? "/nova-text-light.png" : "/nova-text-dark.png"} alt="NOVA" draggable={false} className="kv-nova-logo-word" />
+              <img src={isLight && !homeView ? "/nova-text-light.png" : "/nova-text-dark.png"} alt="NOVA" draggable={false} className="kv-nova-logo-word" />
               <span className="kv-nova-logo-shine" aria-hidden="true" />
             </span>
           </div>
-          <div className="kv-nova-divider" aria-hidden="true" />
-
-          {/* ── PINJ product card — same card, same two-line type system as
-              the NOVA card (see .kv-hdr-title / .kv-hdr-sub). ── */}
-          <div className="kv-nova-box" style={{ marginRight:4, gap:6 }}>
-            <div className="kv-hdr-train"><TrainLogoWithSmoke /></div>
-            <div>
-              <div className="kv-hdr-title"><span className="kv-hdr-accent">PINJ</span> — KAVACH PACKET INJECTOR &amp; DECODER</div>
-              <div className="kv-hdr-sub">RDSO/SPN/196/2020 · ANNEXURE-C · v4.0 · INDIAN RAILWAYS</div>
-            </div>
-          </div>
-
-          {/* ── PKT type pills ── */}
-          <div style={{ display:"flex", gap:4, alignItems:"center" }}>
-            {Object.entries(PKT_META).map(([k,m]) => {
-              const c = isLight ? m.lightColor : m.color;
-              return (
-                <div key={k} className="kv-pkt-pill" style={{
-                  border:`1px solid ${c}55`, background:`linear-gradient(135deg,${c}1e,${c}0a)`,
-                  color:c, padding:"3px 9px", borderRadius:7, fontSize:9,
-                  fontFamily:"var(--font-mono)", fontWeight:700, letterSpacing:"0.05em",
-                  boxShadow:`0 0 8px ${c}18, inset 0 1px 0 rgba(255,255,255,0.05)`,
-                  display:"flex", alignItems:"center", gap:3,
-                  textShadow:`0 0 8px ${c}66`,
-                }}>
-                  {m.icon && <span style={{fontSize:8,filter:`drop-shadow(0 0 3px ${c}88)`}}>{m.icon}</span>}{m.short}
-                </div>
-              );
-            })}
-          </div>
-
           {/* ── Status ── */}
           {status && (
             <div className="kv-status" style={{
@@ -8114,12 +8098,12 @@ export default function App() {
             </div>
           )}
 
+          {/* ── Dock: every control of the bar in one capsule (status · theme · pages · decoder · menu) ── */}
+          <div className="kv-dock" style={{ marginLeft: status ? 10 : "auto" }}>
           {/* ── Backend indicator ── */}
-          <div style={{
-            display:"flex", alignItems:"center", gap:5,
-            fontSize:9, fontFamily:"var(--font-mono)", letterSpacing:"0.06em",
-            borderLeft:`1px solid rgba(245,166,35,0.08)`,
-            paddingLeft:12, marginLeft: status ? 0 : "auto",
+          <div className="kv-dock-status" style={{
+            display:"flex", alignItems:"center", gap:6,
+            fontSize:9, fontFamily:"var(--font-mono)", letterSpacing:"0.1em",
           }}>
             <div style={{position:"relative",display:"flex",alignItems:"center",justifyContent:"center"}}>
               <div style={{
@@ -8149,13 +8133,15 @@ export default function App() {
               textShadow: backendOk===true?"0 0 8px rgba(0,230,118,0.5)":backendOk===false?"0 0 8px rgba(255,23,68,0.5)":"0 0 8px rgba(245,166,35,0.5)",
               fontWeight:700,
             }}>
-              {backendOk===true?"BACKEND":backendOk===false?"OFFLINE":"CHECKING"}
+              {backendOk===true?"ONLINE":backendOk===false?"OFFLINE":"CHECKING"}
             </span>
           </div>
 
+          <span className="kv-dock-sep" aria-hidden="true" />
           {/* ── Buttons ── */}
-          <div style={{ display:"flex", gap:6, alignItems:"center", marginLeft:8 }}>
+          <div className="kv-dock-btns" style={{ display:"flex", gap:6, alignItems:"center" }}>
             <ThemeToggle isLight={isLight} onToggle={() => setIsLight(l => !l)} />
+            <span className="kv-dock-sep" aria-hidden="true" />
 
             <button onClick={() => setActiveTab(t => t==="live"?"decode":"live")}
               className={`kv-btn kv-btn-live${activeTab==="live"?" active":""}`}>
@@ -8173,6 +8159,7 @@ export default function App() {
               🧩 SVK SIM
             </button>
 
+            {activeTab!=="live" && activeTab!=="svksim" && <span className="kv-dock-sep" aria-hidden="true" />}
             {activeTab!=="live" && activeTab!=="svksim" && (
               <button onClick={() => setInputOpen(o => !o)} className="kv-btn kv-btn-ghost">
                 {inputOpen?"▲ HIDE":"▼ INPUT"}
@@ -8201,7 +8188,8 @@ export default function App() {
 
             {/* ⚙ app menu — always the last item of the bar: Settings · Theme · About */}
             <AppMenu isLight={isLight} setIsLight={setIsLight} backendOk={backendOk}
-              onSettings={() => setDialog("settings")} onAbout={() => setDialog("about")} />
+              onSettings={t => setDialog(t ? "settings:" + t : "settings")} onAbout={() => setDialog("about")} />
+          </div>
           </div>
         </div>
 
@@ -8221,7 +8209,7 @@ export default function App() {
           {/* SvkSim is ALWAYS mounted so TX state survives tab switches.
               We just show/hide it with CSS display so the component never
               unmounts and loses its in-progress transmission. */}
-          <div style={{ display: activeTab === "svksim" ? "flex" : "none",
+          <div className="cine-page" style={{ display: activeTab === "svksim" ? "flex" : "none",
                         flexDirection: "column", flex: 1, overflow: "hidden", minHeight: 0 }}>
             <SvkSim isLight={isLight} />
           </div>
@@ -8230,7 +8218,7 @@ export default function App() {
               (tag read status, direction, retained key packets) and the LIVE feed
               connection survive page switches — the backend only re-sends its last
               50 packets on reconnect, which is not enough to rebuild the DMI. */}
-          <div style={{ display: activeTab === "live" ? "flex" : "none",
+          <div className="cine-page" style={{ display: activeTab === "live" ? "flex" : "none",
                         flexDirection: "column", flex: 1, overflow: "hidden", minHeight: 0 }}>
             <LiveTab isLight={isLight} />
           </div>
@@ -8244,7 +8232,7 @@ export default function App() {
               onSampleC42={() => { setInput(SAMPLE_C42); setInputOpen(true); setStatus({t:"info",m:"Sample C.4.2 profile packet loaded"}); }}
             />
           ) : (
-            <div style={{ display:"flex", flexDirection:"column", height:"100%", overflow:"hidden" }}>
+            <div className="cine-page" style={{ display:"flex", flexDirection:"column", height:"100%", overflow:"hidden" }}>
 
               {/* ══ TAB BAR — KAVACH RAILWAY NAVIGATION ══ */}
               <div className="kv-tabbar" style={{ display:"flex", alignItems:"stretch", flexShrink:0 }}>
@@ -8315,7 +8303,7 @@ export default function App() {
                 )}
 
                 {/* ══ TAB CONTENT ══ */}
-                <div style={{flex:1,display:"flex",flexDirection:"column",overflow:"hidden"}}>
+                <div className="cine-panes" style={{flex:1,display:"flex",flexDirection:"column",overflow:"hidden"}}>
 
                   {/* DECODE */}
                   {activeTab==="decode" && activeResult && (
@@ -8625,7 +8613,7 @@ export default function App() {
                     }));
                   }
                 };
-                fetch("http://localhost:8000/decode", {
+                fetch(API_BASE + "/decode", {
                   method:"POST", headers:{"Content-Type":"application/json"},
                   body: JSON.stringify({ packets: pkts }), signal: AbortSignal.timeout(8000),
                 }).then(r => r.json()).then(d => {

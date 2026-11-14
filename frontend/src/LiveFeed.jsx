@@ -1,5 +1,7 @@
 import { useState, useEffect, useRef, useCallback, useMemo } from "react";
 
+import { API_BASE, WS_BASE } from "./apiBase";
+import { UserChip } from "./Auth";
 /* ══════════════════════════════════════════════════════════════
    KAVACH LIVE FEED PAGE
    Connects via WebSocket to ws://localhost:8000/ws/live
@@ -246,8 +248,8 @@ function FeedRow({ pkt, idx, isNew, isLight }) {
 /* ══════════════════════════════════════════════════════════════
    LIVE FEED APP
 ══════════════════════════════════════════════════════════════ */
-const WS_URL = "ws://localhost:8000/ws/live";
-const INGEST_URL = "http://localhost:8000/ingest";
+const WS_URL = WS_BASE + "/ws/live";
+const INGEST_URL = API_BASE + "/ingest";
 
 export default function LiveFeed() {
   const [isLight, setIsLight] = useState(() => localStorage.getItem("kavach-theme") === "light");
@@ -384,7 +386,7 @@ export default function LiveFeed() {
 
   // Clear session
   const clearSession = async () => {
-    await fetch("http://localhost:8000/live/clear", { method: "POST" }).catch(() => { });
+    await fetch(API_BASE + "/live/clear", { method: "POST" }).catch(() => { });
     setPackets([]); setStats(null); pauseBuffer.current = [];
   };
 
@@ -498,6 +500,7 @@ export default function LiveFeed() {
               onMouseLeave={e => { e.currentTarget.style.borderColor = "var(--border)"; e.currentTarget.style.color = "var(--muted)"; }}
             >✕ CLEAR</button>
 
+            <UserChip />
             {/* Theme */}
             <button onClick={() => setIsLight(l => !l)} style={{
               padding: "4px 8px", borderRadius: 5, fontSize: 14,
@@ -582,9 +585,9 @@ export default function LiveFeed() {
             {filtered.length === 0 ? (
               <div style={{ display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", height: "100%", gap: 14, color: "var(--muted)", fontFamily: "var(--font-mono)" }}>
                 <span className={wsState === "open" ? "pulse" : ""} style={{ fontSize: 36 }}>📡</span>
-                <span style={{ fontSize: 13 }}>{wsState === "open" ? "Waiting for packets…" : "Connecting to ws://localhost:8000/ws/live"}</span>
+                <span style={{ fontSize: 13 }}>{wsState === "open" ? "Waiting for packets…" : `Connecting to ${WS_BASE}/ws/live`}</span>
                 <span style={{ fontSize: 10, opacity: 0.6 }}>
-                  External tool: <span style={{ color: "var(--cyan)" }}>POST http://localhost:8000/ingest</span>
+                  External tool: <span style={{ color: "var(--cyan)" }}>POST {API_BASE}/ingest</span>
                 </span>
               </div>
             ) : (

@@ -2,25 +2,30 @@
  * DmiSim.jsx — 🚆 DMI SIM page of the Packet Simulator (/simulator).
  *
  * Left:  the SAME LP-OCIP screen as the 📡 LIVE → DMI page (DmiPanel.jsx DmiScreen + buildDmi),
- *        drawn from the packets this page sent, after the backend decoded them (/ws/live,
- *        source "dmi-*"). So what you see here is exactly what the LIVE DMI decodes.
- * Right: inputs for every packet field that drives a DMI region (Annexure-B A … M), grouped
- *        by packet: own loco (C.4.3 / C.4.6), station C.4.2 (header, MA + signal, track
- *        profile), station C.4.5 SoS and another loco (collision / SoS from loco).
+ *        built from the same LIVE session (/ws/live: history + every new packet, after the
+ *        backend decoded them). So what you see here is exactly what the LIVE DMI shows.
+ * Right: DIRECT mode — one input per DMI region (Annexure-B A … M); the station packet is
+ *        built so each region shows the typed value (loco standing at its reference tag).
+ *        RUN mode — the loco runs along an editable track profile. Both send own loco
+ *        (C.4.3 / C.4.6), station C.4.2, C.4.5 SoS and another loco (collision / SoS).
  * Packets are built bit-exactly by dmiSimEncoder.js and posted to /ingest.
  */
 import { useState, useRef, useEffect, useMemo, useCallback } from "react";
-import { DmiScreen, buildDmi, createDmiKeeper, mergeKept, MODES, LINE_ABBR, SIG_ABBR, ASPECT_NAME } from "./DmiPanel";
+import { API_BASE, WS_BASE } from "./apiBase";
+import { DmiScreen, buildDmi, createDmiKeeper, mergeKept, MODES, LINE_ABBR, SIG_ABBR, ASPECT_NAME, aspectName, stencilNo, STENCIL_MIN } from "./DmiPanel";
 import { tagTableStore, appSettingsStore, useStore } from "./SettingsAbout";
 import { buildC42, buildC43, buildC45, buildC46, sigInfo } from "./dmiSimEncoder";
 
-const INGEST_URL = "http://localhost:8000/ingest";
-const WS_URL = "ws://localhost:8000/ws/live";
+const INGEST_URL = API_BASE + "/ingest";
+const CLEAR_URL = API_BASE + "/live/clear";
+const WS_URL = WS_BASE + "/ws/live";
 
 /* ── option lists (values = Annexure-C codes) ── */
 const MODE_OPTS = Object.entries(MODES).map(([v, m]) => [+v, `${m.key} · ${m.text}`]);
-const ASPECT_OPTS = [[0, "0 · Unidentified (no signal shown)"], ...Object.entries(ASPECT_NAME).map(([v, n]) => [+v, `${v} · ${n}`])];
-const NEXT_ASPECT_OPTS = [[0, "0 · Undefined (current is Red)"], ...Object.entries(ASPECT_NAME).map(([v, n]) => [+v, `${v} · ${n}`])];
+/* stencil route 1…32 is one choice here + a route number (AspectSel) — sent as aspect 32…63 (Annexure-C Amdt-10) */
+const STENCIL_OPT = [STENCIL_MIN, "32–63 · Yellow + Stencil Route 1…32"];
+const ASPECT_OPTS = [[0, "0 · Unidentified (no signal shown)"], ...Object.entries(ASPECT_NAME).map(([v, n]) => [+v, `${v} · ${n}`]), STENCIL_OPT];
+const NEXT_ASPECT_OPTS = [[0, "0 · Undefined (current is Red)"], ...Object.entries(ASPECT_NAME).map(([v, n]) => [+v, `${v} · ${n}`]), STENCIL_OPT];
 const SIG_TYPE_OPTS = [[0, "0 · none"], ...Object.entries(SIG_ABBR).map(([v, n]) => [+v, `${(+v).toString(2).padStart(6, "0")} · ${n}`])];
 const LINE_OPTS = Object.entries(LINE_ABBR).map(([v, n]) => [+v, `${(+v).toString(2).padStart(4, "0")} · ${n}`]);
 const DIR_OPTS = [[1, "1 · Nominal (DOWN)"], [2, "2 · Reverse (UP)"], [0, "0 · Unidentified"]];
@@ -48,6 +53,15 @@ const DEFAULT_PROFILE = {
   tsr: [],
 };
 const DEFAULT = {
+  /* "direct": the DMI shows exactly the values typed (loco stands at the reference tag, the
+     station packet is built so each region gets its value) · "run": loco runs along the profile */
+  simMode: "direct",
+  dTarget: "auto", dTargetDist: 800, dTargetSpeed: 30,         // A (+ B7): Turn Out / TSR / PSR ahead
+  dPermitted: 110,                                              // B3 / B11: section speed
+  dNextTagDist: 300,                                            // L: T Dist to the next tag
+  dRf: 5,                                                       // J3: RF bars (station packets per 10 s)
+  dRadioHere: false, dRadioAhead: 0, dNeutral: 0, dFouling: false, dExit: false,   // J / H track conditions
+  dLcDist: 0, dLcId: 57, dLcUnmanned: false,                    // H: LC gate ahead
   /* own loco — C.4.3 / C.4.6 */
   locoId: 188423, speed: 0, loc: 135000, trainLen: 650, mode: 4, dir: 1, emg: 0, brake: 0, lastTag: 498, tagLink: 0,
   autoRun: false, autoTags: true, missTags: "", locoPkt: "c43", locoMs: 1000, locoAuto: false,
@@ -68,7 +82,7 @@ const DEFAULT = {
 /* ── scenario presets (each only changes what it names; signal presets also set the signal type) ── */
 const HOME = 0b011000;
 const PRESETS = [
-  { k: "fs", label: "FS run · Green", c: "#10b981", p: { mode: 4, speed: 60, aspect: 11, nextAspect: 10, sigType: HOME, authorityType: 2, maUnknown: false, destLocoSos: 0, emg: 0, brake: 0, autoRun: true, locoAuto: true, stAuto: true } },
+  { k: "fs", label: "FS · Green", c: "#10b981", p: { mode: 4, speed: 60, aspect: 11, nextAspect: 10, sigType: HOME, authorityType: 2, maUnknown: false, destLocoSos: 0, emg: 0, brake: 0, locoAuto: true, stAuto: true } },
   { k: "dy", label: "Double Yellow", c: "#dfdf00", p: { aspect: 10, nextAspect: 2, sigType: HOME } },
   { k: "route", label: "Yellow + Route 2", c: "#dfdf00", p: { aspect: 4, nextAspect: 1, sigType: HOME } },
   { k: "red", label: "Red · EoA", c: "#ef4444", p: { aspect: 1, nextAspect: 0, sigType: HOME, maUnknown: false, maWrtSig: 1300, apprSigDist: 1300 } },
@@ -85,9 +99,9 @@ const PRESETS = [
 
 /* ── region sweeps: step one field through every value, so each region state can be checked
       on the DMI (here and on 📡 LIVE → DMI). [field, values, label of a value] ── */
-const ASPECT_SWEEP = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 14, 15, 48];
+const ASPECT_SWEEP = [1, 2, 3, 4, 5, 6, 7, 8, 9, 32, 40, 63, 10, 11, 14, 15, 24];
 const SWEEPS = [
-  { k: "aspect", label: "Signal aspects + route indicators", r: "D1", field: "aspect", values: ASPECT_SWEEP, name: v => `${v} · ${ASPECT_NAME[v]}`, base: { sigType: HOME } },
+  { k: "aspect", label: "Signal aspects + route indicators", r: "D1", field: "aspect", values: ASPECT_SWEEP, name: v => `${v} · ${aspectName(v)}`, base: { sigType: HOME } },
   { k: "sigType", label: "Signal types (D3 name + marker)", r: "D1 D3", field: "sigType", values: Object.keys(SIG_ABBR).map(Number), name: v => SIG_ABBR[v], base: { aspect: 2 } },
   { k: "line", label: "Line names", r: "D3", field: "sigLine", values: Object.keys(LINE_ABBR).map(Number), name: v => LINE_ABBR[v] },
   { k: "mode", label: "Loco modes", r: "B10 G", field: "mode", values: Object.keys(MODES).map(Number), name: v => `${MODES[v].key} · ${MODES[v].text}` },
@@ -106,7 +120,7 @@ function useDmiSimFeed() {
   const keeper = useRef(null);
   if (!keeper.current) keeper.current = createDmiKeeper();
   const [ver, setVer] = useState(0);
-  const cutoff = useRef(0);                                  // packets received before this (ms) belong to an earlier run
+  const seen = useRef(new Set());                            // packet_index already taken (history is re-sent on reconnect)
   useEffect(() => {
     let ws, retry, dead = false;
     const connect = () => {
@@ -116,23 +130,24 @@ function useDmiSimFeed() {
       ws.onerror = () => { try { ws.close(); } catch { /* ignore */ } };
       ws.onmessage = ev => {
         let msg; try { msg = JSON.parse(ev.data); } catch { return; }
-        if (msg.type === "session_cleared") { keeper.current.reset(); setPackets([]); setVer(v => v + 1); return; }
-        // only live packets sent by this page (history from earlier runs is ignored)
-        if (msg.type !== "packet" || !String(msg.data?.source || "").startsWith("dmi-")) return;
-        const p = msg.data;
-        if ((p.received_at || 0) * 1000 < cutoff.current) return;
-        if (keeper.current.ingest(p)) setVer(v => v + 1);
-        setPackets(prev => [...prev, p].slice(-600));
+        if (msg.type === "session_cleared") { keeper.current.reset(); seen.current = new Set(); setPackets([]); setVer(v => v + 1); return; }
+        // the whole LIVE session, exactly like 📡 LIVE: history on connect + every new packet,
+        // from every source — so both DMIs are built from the same packets and always agree
+        const list = msg.type === "packet" ? [msg.data] : msg.type === "history_batch" ? msg.data || [] : [];
+        const fresh = list.filter(p => p && !(p.packet_index != null && seen.current.has(p.packet_index)));
+        if (!fresh.length) return;
+        let kept = false;
+        for (const p of fresh) { if (p.packet_index != null) seen.current.add(p.packet_index); if (keeper.current.ingest(p)) kept = true; }
+        if (kept) setVer(v => v + 1);
+        setPackets(prev => [...prev, ...fresh].slice(-600));
       };
     };
     connect();
     return () => { dead = true; clearTimeout(retry); try { ws.close(); } catch { /* ignore */ } };
   }, []);
-  /* start a clean run: drop everything so far, and anything still in flight from the old run
-     (stamped by the backend within the next 600 ms) */
-  const reset = useCallback(() => {
-    cutoff.current = Date.now() + 600;
-    keeper.current.reset(); setPackets([]); setVer(v => v + 1);
+  /* clear the LIVE session on the backend: both DMIs (and the 📡 LIVE list) start again together */
+  const reset = useCallback(async () => {
+    await fetch(CLEAR_URL, { method: "POST" }).catch(() => {});
   }, []);
   const merged = useMemo(() => mergeKept(packets, keeper.current.packets()), [packets, ver]);
   return { packets: merged, wsState, reset };
@@ -171,6 +186,15 @@ function Sel({ label, r, value, onChange, opts, span }) {
     </Field>
   );
 }
+/* aspect select; for Yellow + Stencil it adds the stencil route number 1…32 (aspect = 31 + route) */
+function AspectSel({ label, r, value, onChange, opts, span }) {
+  const st = stencilNo(value);
+  return <>
+    <Sel label={label} r={r} value={st ? STENCIL_MIN : value} opts={opts} span={span}
+      onChange={v => onChange(v === STENCIL_MIN ? STENCIL_MIN - 1 + (st || 1) : v)} />
+    {st && <Num label="stencil route no. (1–32)" r={r} value={st} min={1} max={32} onChange={n => onChange(STENCIL_MIN - 1 + n)} />}
+  </>;
+}
 function Chk({ label, r, value, onChange }) {
   return (
     <label style={{ display: "flex", alignItems: "center", gap: 6, cursor: "pointer", ...mono, fontSize: 10, color: value ? "var(--tp)" : "var(--ts)", alignSelf: "end", paddingBottom: 5 }}>
@@ -193,6 +217,18 @@ function Section({ title, sub, color, right, children, open: open0 = true }) {
       {open && <div style={{ padding: 10, display: "flex", flexDirection: "column", gap: 9 }}>{children}</div>}
     </div>
   );
+}
+function RegionHead({ r, t, note }) {
+  return (
+    <div style={{ display: "flex", alignItems: "baseline", gap: 7, marginTop: 3, borderTop: "1px solid var(--bdr)", paddingTop: 6 }}>
+      <span style={{ ...mono, fontSize: 11, fontWeight: 800, color: "#00FF00" }}>{r}</span>
+      <span style={{ ...mono, fontSize: 9.5, fontWeight: 700, color: "var(--tp)" }}>{t}</span>
+      {note && <span style={{ ...mono, fontSize: 8.5, color: "var(--tm)", marginLeft: "auto", textAlign: "right" }}>{note}</span>}
+    </div>
+  );
+}
+function Note({ children }) {
+  return <div style={{ ...mono, fontSize: 9, color: "var(--amber)" }}>⚠ {children}</div>;
 }
 function Btn({ children, onClick, color = "var(--amber)", solid, disabled, title }) {
   return (
@@ -249,6 +285,77 @@ function routeTags(s, tagLoc) {
   return out;
 }
 
+/* direct mode: station interval for N RF bars (LIVE DMI counts the cycles with a station packet
+   in the last 10 s); 0 bars = the station stops sending */
+const RF_MS = { 1: 10500, 2: 5200, 3: 3400, 4: 2600, 5: 2000 };
+/* the tags after `ref` on the route: ref+2, ref+4, … (RFID 1…1023) */
+const nextTagIds = (ref, n) => Array.from({ length: n }, (_, k) => ((ref - 1 + 2 * (k + 1)) % 1023) + 1);
+/**
+ * Direct mode: the C.4.2 profile and distance shift that make the DMI show the typed values.
+ * The loco stands at LAST_REF_RFID, so the LIVE DMI's offset (loco ABS − where it first reported
+ * that tag) is 0; if the location was edited, o = that offset, and MA / APPR_SIG_DIST /
+ * DIST_PKT_START are raised by o so every region still shows exactly the typed value.
+ */
+/**
+ * Where the LIVE DMI places each RFID tag of this loco, and its direction on the ABS scale —
+ * the same rule as buildDmi(): a tag sits where the loco first reported it (first valid,
+ * glitch-filtered ABS); the direction is the loco's first move of more than 20 m.
+ */
+function liveAnchors(packets, locoId) {
+  const at = {}; let a0 = null, sg = 0, prevId = null, prevSet = false;
+  for (const p of packets) {
+    const t = Number(p.packet_type_value);
+    if (t !== 10 && t !== 13) continue;
+    let id = null, tag = null;
+    for (const f of p.fields || []) {
+      const k = String(f.Field || "").trim();
+      if (k === "SOURCE_LOCO_ID") id = Number(f["Decimal Value"]);
+      else if (k === "LAST_RFID_TAG") tag = Number(f["Decimal Value"]);
+    }
+    if (id !== locoId) continue;
+    const a = p._absF ?? null;
+    if (a != null) { if (a0 == null) a0 = a; else if (!sg && Math.abs(a - a0) > 20) sg = Math.sign(a - a0); }
+    if (prevSet && tag === prevId) { if (at[tag] === null && a != null) at[tag] = a; continue; }
+    if (!(tag > 0)) continue;
+    prevId = tag; prevSet = true;
+    if (!(tag in at) || at[tag] === null) at[tag] = at[tag] ?? a;
+  }
+  return { at, sg };
+}
+
+function directStation(st, live, tagLoc, book) {
+  const sg = live.sg || (st.pktDir === 2 ? -1 : 1);
+  const anc = tagLoc[st.lastRefRfid] ?? live.at[st.lastRefRfid] ?? null;
+  const o = anc == null ? 0 : Math.max(-16383, Math.min(16383, Math.round(sg * (st.loc - anc))));
+  const td = Math.max(1, st.dTargetDist), tsp = st.dTargetSpeed;
+  const ssp = st.dTarget === "PSR"
+    ? [{ len: td, speed: st.dPermitted }, { len: 32767 - td, speed: tsp }]
+    : [{ len: 32767, speed: st.dPermitted }];
+  const conds = [];
+  if (st.dRadioHere) conds.push({ type: 2, start: 0, len: 2000 });
+  if (st.dRadioAhead > 0) conds.push({ type: 2, start: st.dRadioAhead, len: 300 });
+  if (st.dNeutral > 0) conds.push({ type: 5, start: st.dNeutral, len: 100 });
+  if (st.dFouling) conds.push({ type: 8, start: 0, len: 500 });
+  if (st.dExit) conds.push({ type: 9, start: 0, len: 500 });
+  // A location edit is a relocation: the LIVE DMI keeps a tag list it already has (same tags) at
+  // its old start, so tags between the old and new location would show as MISSED. Changing the
+  // list (one tag more / less each time the shift changes) makes it take the list afresh.
+  if (book.lastO !== o) { book.lastO = o; book.reloc = (book.reloc || 0) + 1; }
+  const ids = nextTagIds(st.lastRefRfid, 6 + ((book.reloc || 0) % 2));
+  return {
+    o,
+    profile: {
+      ssp,
+      grad: [],
+      lc: st.dLcDist > 0 ? [{ dist: st.dLcDist, id: st.dLcId, unmanned: st.dLcUnmanned ? 1 : 0 }] : [],
+      turnouts: st.dTarget === "Turnout" ? [{ speed: tsp, dist: td, release: 100 }] : [],
+      tags: ids.map((id, i) => ({ dist: i === 0 ? Math.max(1, st.dNextTagDist) : 300, id })),
+      conds,
+      tsr: st.dTarget === "TSR" ? [{ id: 1, start: td, len: 500, speed: tsp }] : [],
+    },
+  };
+}
+
 /* ═══════════════════════════════════════════════════════════════
    PAGE
 ═══════════════════════════════════════════════════════════════ */
@@ -267,6 +374,9 @@ export default function DmiSim({ be }) {
   const [now, setNow] = useState(Date.now());
   useEffect(() => { const t = setInterval(() => setNow(Date.now()), 500); return () => clearInterval(t); }, []);
   const d = useMemo(() => buildDmi(packets, s.locoId, now, tagLoc, { tagMissM: dmiTagMissM }), [packets, s.locoId, now, tagLoc, dmiTagMissM]);
+  // where the LIVE DMI has this loco's tags (from the same packets) — direct mode measures from these
+  const live = useMemo(() => liveAnchors(packets, s.locoId), [packets, s.locoId]);
+  const liveRef = useRef(live); liveRef.current = live;
 
   /* ── sent-packet log ── */
   const [log, setLog] = useState([]);
@@ -286,11 +396,12 @@ export default function DmiSim({ be }) {
 
   /* ── own loco: optional run (ABS from speed) + automatic tag reading, then C.4.3 / C.4.6 ── */
   const lastTick = useRef(null);
+  const book = useRef({});                       // direct mode: last distance shift + relocation count
   const sendLoco = useCallback(async () => {
     let st = R.current;
     const t = performance.now(), dt = lastTick.current == null ? 0 : Math.min(5, (t - lastTick.current) / 1000);
     lastTick.current = t;
-    if (st.autoRun && st.speed > 0 && dt > 0) {
+    if (st.simMode === "run" && st.autoRun && st.speed > 0 && dt > 0) {
       const sg = st.dir === 2 ? -1 : 1;
       const loc = Math.max(0, Math.round(st.loc + sg * (st.speed / 3.6) * dt));
       let lastTag = st.lastTag;
@@ -317,17 +428,23 @@ export default function DmiSim({ be }) {
   const profSent = useRef("");
   const sendStation = useCallback(async () => {
     const st = R.current;
-    const profKey = JSON.stringify([st.profile, st.lastRefRfid, st.dps, st.refProfId]);
-    const withProfile = st.profEvery || profSent.current !== profKey;
+    // direct: profile built from the region values, and every distance shifted by how far the loco
+    // stands past LAST_REF_RFID (normally 0) so the DMI shows exactly the typed value
+    const dx = st.simMode === "direct" ? directStation(st, liveRef.current, tagLocRef.current, book.current) : null;
+    const profile = dx ? dx.profile : st.profile;
+    const dps = dx ? dx.o : st.dps;
+    const profKey = JSON.stringify([profile, st.lastRefRfid, dps, st.refProfId]);
+    const withProfile = dx || st.profEvery || profSent.current !== profKey;
     profSent.current = profKey;
+    const o = dx ? dx.o : 0;
     const hex = buildC42({
       stnId: st.stnId, destLocoId: st.toAll ? 0 : st.locoId, refProfId: st.refProfId, lastRefRfid: st.lastRefRfid,
-      distPktStart: st.dps, pktDir: st.pktDir,
+      distPktStart: dps, pktDir: st.pktDir,
       ma: { destLocoSos: st.destLocoSos, trainSectionType: st.sectionType,
         curSigInfo: sigInfo({ stop: st.sigStop, override: st.sigOverride, type: st.sigType, line: st.sigLine, lineNo: st.sigLineNo }),
-        curSigAspect: st.aspect, nextSigAspect: st.nextAspect, apprSigDist: st.apprSigDist, authorityType: st.authorityType,
-        authorizedSpeed: st.authorizedSpeed, maWrtSig: st.maUnknown ? 65535 : st.maWrtSig, reqShortenMa: st.reqShortenMa, newMa: st.newMa },
-      profile: withProfile ? st.profile : null,
+        curSigAspect: st.aspect, nextSigAspect: st.nextAspect, apprSigDist: st.apprSigDist + o, authorityType: st.authorityType,
+        authorizedSpeed: st.authorizedSpeed, maWrtSig: st.maUnknown ? 65535 : st.maWrtSig + o, reqShortenMa: st.reqShortenMa, newMa: st.newMa + o },
+      profile: withProfile ? profile : null,
     });
     await post(hex, withProfile ? "C.4.2 + profile" : "C.4.2", "dmi-station", "0xAA");
   }, [post]);
@@ -345,12 +462,49 @@ export default function DmiSim({ be }) {
     const t = setInterval(sendLoco, s.locoMs);
     return () => clearInterval(t);
   }, [s.locoAuto, s.locoMs, sendLoco]);
+  // direct mode: the station interval sets the RF bars (J3 = station packets in the last 5 cycles)
+  const stEvery = s.simMode === "direct" ? RF_MS[s.dRf] || 0 : s.stMs;
   useEffect(() => {
-    if (!s.stAuto) return undefined;
+    if (!s.stAuto || !stEvery) return undefined;
     sendStation();
-    const t = setInterval(sendStation, s.stMs);
+    const t = setInterval(sendStation, stEvery);
     return () => clearInterval(t);
-  }, [s.stAuto, s.stMs, sendStation]);
+  }, [s.stAuto, stEvery, sendStation]);
+
+  /* direct mode: every change is sent at once (while AUTO TX is on) — the DMI follows the inputs.
+     The station packet is pushed early only at 5 RF bars, so a lower bar count stays as set. */
+  const directSig = s.simMode === "direct" ? JSON.stringify(s) : "";
+  const pushedLoc = useRef(null);
+  useEffect(() => {
+    if (!directSig) return undefined;
+    const t = setTimeout(() => {
+      const st = R.current;
+      const moved = pushedLoc.current != null && pushedLoc.current !== st.loc;   // location edited: new tag list first
+      pushedLoc.current = st.loc;
+      // moved back behind the last tag: distances from it can't be sent (they'd be negative), so
+      // the loco reads the next tag right here and everything is measured from that tag
+      const lv = liveRef.current;
+      const sg = lv.sg || (st.pktDir === 2 ? -1 : 1);
+      const anc = tagLocRef.current[st.lastRefRfid] ?? lv.at[st.lastRefRfid] ?? null;
+      if (moved && anc != null && sg * (st.loc - anc) < 0) { stepTagRef.current(false); return; }
+      if (st.stAuto && (st.dRf === 5 || moved)) sendStation();
+      if (st.locoAuto) setTimeout(sendLoco, 120);
+    }, 250);
+    return () => clearTimeout(t);
+  }, [directSig, sendLoco, sendStation]);
+
+  /* Region M (direct): the loco reports the next tag — or the one after it, so the next one is
+     MISSED — then the station moves LAST_REF_RFID to that tag; the loco stays where it is */
+  const stepTag = skip => {
+    const st = R.current;
+    const id = nextTagIds(st.lastRefRfid, 2)[skip ? 1 : 0];
+    upd({ lastTag: id });
+    setTimeout(() => sendLoco(), 60);
+    setTimeout(() => upd({ lastRefRfid: id }), 1500);
+  };
+  const stepTagRef = useRef(stepTag);
+  stepTagRef.current = stepTag;
+  const setMode = m => upd(p => (m === "direct" ? { simMode: m, autoRun: false, lastTag: p.lastRefRfid, refTagAbs: p.loc } : { simMode: m }));
 
   /* ── region sweep: one value every `dwell` ms, sent at once so both DMIs change together ── */
   const [sweep, setSweep] = useState(null);                      // { k, i, loop }
@@ -387,10 +541,14 @@ export default function DmiSim({ be }) {
   };
   const curSweep = sweep ? SWEEPS.find(x => x.k === sweep.k) : null;
 
+  /* clear the LIVE session (both DMIs and the 📡 LIVE list start again); in run mode the loco also
+     goes back to the LAST_REF_RFID tag. Cleared a moment later, so packets still on their way
+     from before the reset do not land in the new session. */
   const resetRun = () => {
     const ref = tagLoc[s.lastRefRfid] ?? s.refTagAbs;
-    upd({ loc: ref, lastTag: s.lastRefRfid });
-    resetFeed();
+    upd(s.simMode === "direct" ? { lastTag: s.lastRefRfid, refTagAbs: s.loc } : { loc: ref, lastTag: s.lastRefRfid });
+    book.current = {};
+    setTimeout(resetFeed, 400);
   };
   const applyPreset = p => upd(p.p);
 
@@ -405,7 +563,7 @@ export default function DmiSim({ be }) {
       <div style={{ display: "flex", flexDirection: "column", minWidth: 0, minHeight: 0, overflow: "hidden", borderRight: "1px solid var(--bdr)" }}>
         <div style={{ display: "flex", alignItems: "center", gap: 10, padding: "6px 12px", borderBottom: "1px solid var(--bdr)", background: "var(--surf)", flexShrink: 0, flexWrap: "wrap" }}>
           <span style={{ ...mono, fontSize: 10, fontWeight: 700, color: "#00FF00", letterSpacing: ".1em" }}>LP-OCIP · ANNEXURE-B</span>
-          <span style={{ ...mono, fontSize: 9, color: "var(--ts)" }}>same screen as 📡 LIVE → DMI, decoded from the packets sent below</span>
+          <span style={{ ...mono, fontSize: 9, color: "var(--ts)" }}>same screen and same LIVE session as 📡 LIVE → DMI</span>
           <span style={{ marginLeft: "auto", ...mono, fontSize: 9, color: wsState === "open" ? "var(--green)" : "var(--red)" }}>
             ● LIVE feed {wsState === "open" ? "connected" : wsState} · loco {sent.loco} · station {sent.stn}{sent.err ? ` · ${sent.err} failed` : ""}
           </span>
@@ -444,6 +602,96 @@ export default function DmiSim({ be }) {
           {PRESETS.map(p => <Btn key={p.k} color={p.c} onClick={() => applyPreset(p)}>{p.label}</Btn>)}
         </div>
 
+        {/* mode */}
+        <div style={{ display: "flex", gap: 5, flexShrink: 0, alignItems: "center" }}>
+          {[["direct", "🎯 DIRECT — DMI shows exactly what you type"], ["run", "🚆 RUN — loco runs along the track profile"]].map(([m, t]) => (
+            <button key={m} onClick={() => s.simMode !== m && setMode(m)} style={{ flex: 1, padding: "7px 8px", borderRadius: 6, ...mono, fontSize: 10, fontWeight: 700,
+              border: `1px solid ${s.simMode === m ? "#00FF00" : "var(--bdr2)"}`, background: s.simMode === m ? "rgba(0,255,0,.1)" : "var(--raised)", color: s.simMode === m ? "#00FF00" : "var(--ts)" }}>{t}</button>
+          ))}
+        </div>
+
+        {s.simMode === "direct" && (
+          <Section title="🎯 DMI REGIONS" sub="each value goes to its region as typed" color="#00FF00"
+            right={<span style={{ display: "flex", gap: 5 }}>
+              <Btn color="#00FF00" solid={s.locoAuto && s.stAuto} onClick={() => { const on = !(s.locoAuto && s.stAuto); upd({ locoAuto: on, stAuto: on }); }}>
+                {s.locoAuto && s.stAuto ? "■ STOP" : "▶ AUTO TX"}</Btn>
+              <Btn color="#00FF00" onClick={() => { sendLoco(); setTimeout(sendStation, 150); }}>⚡ SEND</Btn>
+            </span>}>
+            <RegionHead r="A" t="Target distance" note="EoA = the MA (C) when nothing is nearer · Collision / SoS from H-I below" />
+            <Grid cols={3}>
+              <Sel label="Target ahead" r="A B7 H" value={s.dTarget} opts={[["auto", "EoA / none"], ["Turnout", "Turn Out"], ["TSR", "TSR"], ["PSR", "PSR"]]} onChange={v => upd({ dTarget: v })} />
+              <Num label="distance (m)" r="A" value={s.dTargetDist} min={1} max={32000} onChange={v => upd({ dTargetDist: v })} disabled={s.dTarget === "auto"} />
+              <Num label="speed (kmph)" r="A B7" value={s.dTargetSpeed} min={5} max={s.dTarget === "Turnout" ? 90 : 250} step={5} onChange={v => upd({ dTargetSpeed: v })} disabled={s.dTarget === "auto"} />
+            </Grid>
+            {s.dTarget !== "auto" && s.dTargetSpeed >= s.dPermitted && <Note>shown only when its speed is below the permitted speed (B3)</Note>}
+            {s.dTarget !== "auto" && s.dTargetDist > 2000 && <Note>Region A shows targets within 2000 m</Note>}
+
+            <RegionHead r="B" t="Speed and distance monitoring" />
+            <Field label={`B1 TRAIN_SPEED · ${s.speed} kmph`} r="B1">
+              <input type="range" min={0} max={250} value={s.speed} onChange={e => upd({ speed: Number(e.target.value) })} style={{ width: "100%", accentColor: "#00FF00" }} />
+            </Field>
+            <Grid cols={3}>
+              <Num label="speed (kmph)" r="B1" value={s.speed} max={400} onChange={v => upd({ speed: v })} />
+              <Num label="permitted (kmph)" r="B3 B11" value={s.dPermitted} min={5} max={250} step={5} onChange={v => upd({ dPermitted: v })} />
+              <Sel label="authority" r="B3" value={s.authorityType} opts={AUTH_OPTS} onChange={v => upd({ authorityType: v })} />
+              <Num label="OS speed (kmph)" r="B3" value={s.authorizedSpeed} min={5} max={250} step={5} onChange={v => upd({ authorizedSpeed: v })} disabled={s.authorityType !== 1} />
+              <Sel label="brake" r="B8" value={s.brake} opts={BRAKE_OPTS} onChange={v => upd({ brake: v })} span={2} />
+              <Num label="location (m)" r="B9" value={s.loc} max={8388606} onChange={v => upd({ loc: v })} />
+              <Sel label="mode" r="B10 G" value={s.mode} opts={MODE_OPTS} onChange={v => upd({ mode: v })} span={2} />
+              <Num label="loco ID" r="B" value={s.locoId} max={999999} onChange={v => upd({ locoId: v })} />
+              <Num label="train length (m)" r="F" value={s.trainLen} max={2047} onChange={v => upd({ trainLen: v })} />
+            </Grid>
+
+            <RegionHead r="C" t="Movement authority" />
+            <Grid cols={3}>
+              <Num label="MA (m)" r="C" value={s.maWrtSig} max={60000} onChange={v => upd({ maWrtSig: v })} disabled={s.maUnknown} />
+              <Chk label="unknown (blank)" r="C" value={s.maUnknown} onChange={v => upd({ maUnknown: v })} />
+              <Chk label="shorten MA →" r="C" value={s.reqShortenMa} onChange={v => upd({ reqShortenMa: v })} />
+              <Num label="new MA (m)" r="C" value={s.newMa} max={60000} onChange={v => upd({ newMa: v })} disabled={!s.reqShortenMa} />
+            </Grid>
+
+            <RegionHead r="D" t="Signal" />
+            <Grid cols={3}>
+              <AspectSel label="aspect / route indicator" r="D1" value={s.aspect} opts={ASPECT_OPTS} onChange={v => upd({ aspect: v })} span={2} />
+              <Num label="signal distance (m)" r="D2" value={s.apprSigDist} max={32000} onChange={v => upd({ apprSigDist: v })} />
+              <Sel label="signal type (name + marker)" r="D3 D1" value={s.sigType} opts={SIG_TYPE_OPTS} onChange={v => upd({ sigType: v })} span={2} />
+              <Sel label="line" r="D3" value={s.sigLine} opts={LINE_OPTS} onChange={v => upd({ sigLine: v })} />
+              <AspectSel label="next signal aspect" value={s.nextAspect} opts={NEXT_ASPECT_OPTS} onChange={v => upd({ nextAspect: v })} span={2} />
+            </Grid>
+
+            <RegionHead r="H I" t="System / context messages" note="TSR / PSR / Turn Out / EoA messages come from A and C" />
+            <Grid cols={3}>
+              <Sel label="station DEST_LOCO_SOS" r="A H I" value={s.destLocoSos} opts={SOS_OPTS} onChange={v => upd({ destLocoSos: v })} span={2} />
+              <Num label="LC gate ahead (m, 0 = none)" r="H" value={s.dLcDist} max={32000} onChange={v => upd({ dLcDist: v })} />
+              <Sel label="own EMERGENCY_STATUS" r="A H I" value={s.emg} opts={EMG_OPTS} onChange={v => upd({ emg: v })} span={2} />
+              <Chk label="unmanned LC" r="H" value={s.dLcUnmanned} onChange={v => upd({ dLcUnmanned: v })} />
+              <Num label="radio hole ahead (m)" r="H" value={s.dRadioAhead} max={32000} onChange={v => upd({ dRadioAhead: v })} />
+              <Num label="neutral section ahead (m)" r="H" value={s.dNeutral} max={32000} onChange={v => upd({ dNeutral: v })} />
+              <Num label="LC gate no" r="H" value={s.dLcId} max={1023} onChange={v => upd({ dLcId: v })} />
+              <Chk label="fouling mark entry" r="H" value={s.dFouling} onChange={v => upd({ dFouling: v })} />
+              <Chk label="KAVACH territory exit" r="H" value={s.dExit} onChange={v => upd({ dExit: v })} />
+            </Grid>
+
+            <RegionHead r="J" t="Radio" />
+            <Grid cols={3}>
+              <Sel label="RF bars" r="J3" value={s.dRf} opts={[[5, "5 bars"], [4, "4 bars"], [3, "3 bars"], [2, "2 bars"], [1, "1 bar"], [0, "0 (station stops)"]]} onChange={v => upd({ dRf: v })} />
+              <Chk label="in radio hole" r="J" value={s.dRadioHere} onChange={v => upd({ dRadioHere: v })} />
+            </Grid>
+
+            <RegionHead r="L M" t="Tag" />
+            <Grid cols={3}>
+              <Num label="last tag (Tid)" r="L M" value={s.lastRefRfid} min={1} max={1023} onChange={v => upd({ lastRefRfid: v, lastTag: v })} />
+              <Sel label="direction (Dir)" r="L" value={s.dir} opts={DIR_OPTS.slice(0, 2)} onChange={v => upd({ dir: v, pktDir: v })} />
+              <Num label="next tag (T Dist, m)" r="L" value={s.dNextTagDist} min={1} max={2047} onChange={v => upd({ dNextTagDist: v })} />
+            </Grid>
+            <div style={{ display: "flex", gap: 5, flexWrap: "wrap", alignItems: "center" }}>
+              <Btn color="var(--green)" onClick={() => stepTag(false)} title="the loco reads the next tag → M1 = that tag, read">✓ Read next tag (#{nextTagIds(s.lastRefRfid, 1)[0]})</Btn>
+              <Btn color="var(--red)" onClick={() => stepTag(true)} title="the loco skips the next tag and reads the one after → that one read, the skipped one MISSED">✗ Miss next tag (#{nextTagIds(s.lastRefRfid, 1)[0]})</Btn>
+              <Btn color="var(--cyan)" onClick={resetRun} title="clears the LIVE session on the backend — this DMI, 📡 LIVE → DMI and the LIVE packet list start again (M back to grey)">⟲ Clear LIVE session</Btn>
+            </div>
+          </Section>
+        )}
+
         {/* region sweeps */}
         <Section title="🔁 REGION SWEEP" sub="steps one field through every value — check each on the DMI" color="#00FF00"
           right={<span style={{ display: "flex", gap: 6, alignItems: "center" }}>
@@ -475,7 +723,7 @@ export default function DmiSim({ be }) {
         </Section>
 
         {/* ── own loco ── */}
-        <Section title="🚆 LOCO · C.4.3 / C.4.6" sub={`→ ${s.locoPkt === "both" ? "C.4.3 + C.4.6" : s.locoPkt === "c43" ? "C.4.3" : "C.4.6"} every ${s.locoMs / 1000} s`} color="#10b981"
+        <Section key={"loco-" + s.simMode} open={s.simMode === "run"} title="🚆 LOCO · C.4.3 / C.4.6" sub={`→ ${s.locoPkt === "both" ? "C.4.3 + C.4.6" : s.locoPkt === "c43" ? "C.4.3" : "C.4.6"} every ${s.locoMs / 1000} s`} color="#10b981"
           right={<span style={{ display: "flex", gap: 5 }}>
             <Btn color="#10b981" solid={s.locoAuto} onClick={() => upd({ locoAuto: !s.locoAuto })}>{s.locoAuto ? "■ STOP" : "▶ AUTO TX"}</Btn>
             <Btn color="#10b981" onClick={sendLoco}>⚡ SEND</Btn>
@@ -497,11 +745,11 @@ export default function DmiSim({ be }) {
             <Sel label="EMERGENCY_STATUS" r="A H I" value={s.emg} opts={EMG_OPTS} onChange={v => upd({ emg: v })} span={2} />
             <Sel label="TAG_LINK_INFO" value={s.tagLink} opts={TAGLINK_OPTS} onChange={v => upd({ tagLink: v })} />
           </Grid>
-          <div style={{ border: "1px dashed var(--bdr2)", borderRadius: 6, padding: 8, display: "flex", flexDirection: "column", gap: 7 }}>
+          {s.simMode === "run" && <div style={{ border: "1px dashed var(--bdr2)", borderRadius: 6, padding: 8, display: "flex", flexDirection: "column", gap: 7 }}>
             <Grid cols={3}>
               <Chk label="Run (ABS from speed)" r="B9" value={s.autoRun} onChange={v => upd({ autoRun: v })} />
               <Chk label="Read route tags" r="L M" value={s.autoTags} onChange={v => upd({ autoTags: v })} />
-              <Btn color="var(--cyan)" onClick={resetRun} title="Loco back to the LAST_REF_RFID tag, clear this page's DMI history">⟲ Reset run</Btn>
+              <Btn color="var(--cyan)" onClick={resetRun} title="Loco back to the LAST_REF_RFID tag and the LIVE session cleared (both DMIs and the LIVE list start again)">⟲ Reset run</Btn>
               <Num label="LAST_RFID_TAG" r="L M" value={s.lastTag} max={1023} onChange={v => upd({ lastTag: v })} />
               <Field label="Miss tag IDs (comma)" r="M H">
                 <input value={s.missTags} placeholder="e.g. 502" onChange={e => upd({ missTags: e.target.value })} style={inpS} />
@@ -515,11 +763,12 @@ export default function DmiSim({ be }) {
                   style={{ ...mono, fontSize: 9, padding: "1px 6px", borderRadius: 8, border: `1px solid ${col}`, color: col }}>#{t.id} · {Math.round(t.pos)}</span>;
               })}
             </div>
-          </div>
+          </div>}
         </Section>
 
         {/* ── station C.4.2 header + MA ── */}
-        <Section title="📡 STATION · C.4.2 Regular" sub={`→ every ${s.stMs / 1000} s · RF bars = cycles with a station packet`} color="#06b6d4"
+        <Section key={"stn-" + s.simMode} open={s.simMode === "run"} title="📡 STATION · C.4.2 Regular"
+          sub={s.simMode === "direct" ? (stEvery ? `→ every ${(stEvery / 1000).toFixed(1)} s (RF bars in J)` : "→ stopped (0 RF bars)") : `→ every ${s.stMs / 1000} s · RF bars = cycles with a station packet`} color="#06b6d4"
           right={<span style={{ display: "flex", gap: 5 }}>
             <Btn color="#06b6d4" solid={s.stAuto} onClick={() => upd({ stAuto: !s.stAuto })}>{s.stAuto ? "■ STOP" : "▶ AUTO TX"}</Btn>
             <Btn color="#06b6d4" onClick={sendStation}>⚡ SEND</Btn>
@@ -545,9 +794,9 @@ export default function DmiSim({ be }) {
             <Num label="NEW_MA (m)" r="C" value={s.newMa} max={65535} onChange={v => upd({ newMa: v })} disabled={!s.reqShortenMa} />
             <Sel label="AUTHORITY_TYPE" r="B3" value={s.authorityType} opts={AUTH_OPTS} onChange={v => upd({ authorityType: v })} />
             <Num label="AUTHORIZED_SPEED (kmph)" r="B3" value={s.authorizedSpeed} min={5} max={250} step={5} onChange={v => upd({ authorizedSpeed: v })} disabled={s.authorityType !== 1} />
-            <Sel label="CUR_SIG_ASPECT" r="D1" value={s.aspect} opts={ASPECT_OPTS} onChange={v => upd({ aspect: v })} span={2} />
+            <AspectSel label="CUR_SIG_ASPECT" r="D1" value={s.aspect} opts={ASPECT_OPTS} onChange={v => upd({ aspect: v })} span={2} />
             <Num label="APPR_SIG_DIST (m)" r="D2" value={s.apprSigDist} max={32767} onChange={v => upd({ apprSigDist: v })} />
-            <Sel label="NEXT_SIG_ASPECT" value={s.nextAspect} opts={NEXT_ASPECT_OPTS} onChange={v => upd({ nextAspect: v })} span={2} />
+            <AspectSel label="NEXT_SIG_ASPECT" value={s.nextAspect} opts={NEXT_ASPECT_OPTS} onChange={v => upd({ nextAspect: v })} span={2} />
             <Sel label="DEST_LOCO_SOS" r="A H I" value={s.destLocoSos} opts={SOS_OPTS} onChange={v => upd({ destLocoSos: v })} />
           </Grid>
           <div style={{ ...mono, fontSize: 9, fontWeight: 700, color: "var(--tp)", marginTop: 2 }}>CUR_SIG_INFO <span style={{ color: "var(--tm)", fontWeight: 400 }}>= {sigInfo({ stop: s.sigStop, override: s.sigOverride, type: s.sigType, line: s.sigLine, lineNo: s.sigLineNo })}</span></div>
@@ -560,8 +809,8 @@ export default function DmiSim({ be }) {
           </Grid>
         </Section>
 
-        {/* ── track profile ── */}
-        <Section title="🗺 TRACK PROFILE · C.4.2 sub-packets" sub="distances from the packet start (LAST_REF_RFID + DIST_PKT_START)" color="#8b5cf6"
+        {/* ── track profile (run mode — in direct mode it is built from the region values) ── */}
+        {s.simMode === "run" && <Section title="🗺 TRACK PROFILE · C.4.2 sub-packets" sub="distances from the packet start (LAST_REF_RFID + DIST_PKT_START)" color="#8b5cf6"
           right={<Chk label="in every C.4.2" value={s.profEvery} onChange={v => upd({ profEvery: v })} />}>
           <Rows title="Static speed profile (SSP)" r="B3 B7 B11 A H" rows={s.profile.ssp} onChange={v => setProf("ssp", v)} blank={{ len: 500, speed: 60 }}
             cols={[{ k: "len", label: "length (m)", max: 32767 }, { k: "speed", label: "speed (kmph)", max: 250 }]} />
@@ -577,7 +826,7 @@ export default function DmiSim({ be }) {
             cols={[{ k: "dist", label: "from previous tag (m)", max: 2047 }, { k: "id", label: "RFID tag", max: 1023 }]} />
           <Rows title="Gradient" rows={s.profile.grad} onChange={v => setProf("grad", v)} blank={{ dist: 0, up: 0, value: 0 }}
             cols={[{ k: "dist", label: "start (m)", max: 32767 }, { k: "up", label: "uphill", chk: true, w: "60px" }, { k: "value", label: "value (0-30)", max: 31 }]} />
-        </Section>
+        </Section>}
 
         {/* ── C.4.5 + other loco ── */}
         <Section title="🚨 EMERGENCIES · C.4.5 / other loco" color="#ef4444" open={false}>
@@ -602,7 +851,9 @@ export default function DmiSim({ be }) {
         <div style={{ ...mono, fontSize: 9, color: "var(--tm)", lineHeight: 1.6, padding: "0 2px 6px" }}>
           Region E (DC) is always "DC –.––" on the LIVE DMI — no packet carries it. H and I messages come from the packet values (mode, emergency,
           DEST_LOCO_SOS, brake, MA ≤ 2000 m, LC gates, track conditions, TSR / PSR / turnout ahead), exactly as on the LIVE DMI.
-          Packets go to the LIVE feed with source <b>dmi-loco</b> / <b>dmi-station</b>, so 📡 LIVE → DMI shows the same.
+          Packets go to the LIVE feed with source <b>dmi-loco</b> / <b>dmi-station</b>, and this DMI is built from the same LIVE
+          session, so 📡 LIVE → DMI shows the same. Other packets for this loco ID (e.g. from the serial modem) show on both too.
+          Moving the location back behind the last tag makes the loco read the next tag there.
         </div>
       </div>
     </div>
@@ -625,7 +876,7 @@ function RegionTable({ d }) {
     ["B10 G", "Mode", d.mode ? `${d.mode.key} · ${d.mode.text}` : "—"],
     ["B11", "Section speed", r(d.sectionSpeed, " kmph")],
     ["C", "MA", r(d.ma, " m")],
-    ["D1", "Signal", d.lamps ? `${d.aspectName}${d.marker ? ` · ${d.marker}` : ""}${d.routeInd ? ` · route ${d.routeInd}` : ""}` : "—"],
+    ["D1", "Signal", d.lamps ? `${d.aspectName}${d.marker ? ` · ${d.marker}` : ""}${d.routeInd && !d.stencil ? ` · route ${d.routeInd}` : ""}` : "—"],
     ["D2", "Signal dist", d.lamps ? r(d.sigDist, " m") : "—"],
     ["D3", "Signal name", d.lamps && d.d3 ? d.d3 : "—"],
     ["F", "Train length", r(d.trainLen, " m")],

@@ -11,3 +11,14 @@ Put the 4 recordings in THIS folder with these names
 e.g. brake-nsb.mp3
 
 Then: Settings -> SOUND -> VOICE-OVER -> RE-CHECK (or reload the page).
+
+Route announcements (Settings -> SOUND -> ROUTE ANNOUNCEMENTS), same folder:
+
+  cue-danger                -> approaching a Red signal
+  cue-attention             -> approaching a Double Yellow signal
+  cue-caution               -> approaching a Yellow signal
+  cue-proceed               -> approaching a Green signal
+  cue-approaching-turnout   -> approaching a turnout
+  cue-entered-turnout       -> entered the turnout section
+  cue-approaching-psr       -> approaching a PSR
+  cue-entered-psr           -> entered the PSR section

@@ -1,6 +1,6 @@
 {
-  "mode": "decode_live",
-  "tty_device": "/dev/ttyUSB0",
+  "mode": "sim_loopback",
+  "tty_device": "SIM_LOOPBACK",
   "baud_rate": 57600,
   "read_timeout_s": 0.25,
   "write_timeout_s": 1.0,

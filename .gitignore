@@ -1,0 +1,16 @@
+# PINJ (Windows server) — kept out of version control
+
+# Python / Node environments and build output (reinstallable)
+.venv/
+venv/
+node_modules/
+frontend/dist/
+__pycache__/
+*.pyc
+
+# run data: user accounts, sessions, benches, uploaded files, console token, library settings
+data/
+logs/
+
+# MySQL connection settings — contains the database password (made by SETUP_DATABASE.bat)
+backend/pinj_db.json

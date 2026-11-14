@@ -1,26 +1,27 @@
-// import { StrictMode } from "react";
-// import { createRoot } from "react-dom/client";
-// import App from "./App.jsx";
-
-// createRoot(document.getElementById("root")).render(
-//   <StrictMode>
-//     <App />
-//   </StrictMode>
-// );
-
-import React from "react";
+/**
+ * main.jsx — multi-user PINJ start-up.
+ * The sign-in page comes first (Auth.jsx). The app's own pages are loaded only after the
+ * user is signed in, so their saved settings (localStorage) are read for that user.
+ */
+import React, { Suspense, lazy } from "react";
 import ReactDOM from "react-dom/client";
-import App from "./App.jsx";
-import LiveFeed from "./LiveFeed.jsx";
-import PacketSimulator from "./PacketSimulator.jsx";
+import { AuthGate } from "./Auth.jsx";
+import CinematicTheme from "./CinematicTheme.jsx";
+
+const App = lazy(() => import("./App.jsx"));
+const LiveFeed = lazy(() => import("./LiveFeed.jsx"));
+const PacketSimulator = lazy(() => import("./PacketSimulator.jsx"));
 
 const path = window.location.pathname;
-const root = ReactDOM.createRoot(document.getElementById("root"));
+const Page = path === "/live" ? LiveFeed : path === "/simulator" ? PacketSimulator : App;
 
-if (path === "/live") {
-  root.render(<LiveFeed />);
-} else if (path === "/simulator") {
-  root.render(<PacketSimulator />);
-} else {
-  root.render(<App />);
-}
+ReactDOM.createRoot(document.getElementById("root")).render(
+  <AuthGate render={() => (
+    <>
+      <Suspense fallback={<div style={{ position: "fixed", inset: 0, background: "#05090a" }} />}>
+        <Page />
+      </Suspense>
+      <CinematicTheme />
+    </>
+  )} />
+);

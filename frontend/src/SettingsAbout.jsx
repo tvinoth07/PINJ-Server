@@ -9,15 +9,28 @@
  * backend and nothing here touches packet encoding / decoding.
  */
 import { useState, useEffect, useRef, useSyncExternalStore } from "react";
+import { API_BASE, WS_BASE } from "./apiBase";
+import { LOCO_STYLES, LocoStylePreview } from "./LocoStyles";
+import { CURRENT_USER_KEY, ProfilePanel, UsersPanel, useCurrentUser, signOut, hub } from "./Auth";
+import { LibraryAdminPanel } from "./Library";
 
 /* ═══════════════════════════════════════════════════════════════
    STORES
 ═══════════════════════════════════════════════════════════════ */
-function createStore(key, defaults) {
+/* Multi-user PINJ: saved settings are kept per signed-in user ("u:<user>:<key>"). A user's
+   first start in this browser begins from the browser's older (shared) settings, if any. */
+function userKey(key) {
+  let u = null;
+  try { u = localStorage.getItem(CURRENT_USER_KEY); } catch (_) { /* storage blocked */ }
+  return u ? `u:${u}:${key}` : key;
+}
+
+function createStore(baseKey, defaults) {
+  const key = baseKey ? userKey(baseKey) : null;
   const read = () => {
     if (!key) return { ...defaults };
     try {
-      const saved = JSON.parse(localStorage.getItem(key) || "null");
+      const saved = JSON.parse(localStorage.getItem(key) ?? localStorage.getItem(baseKey) ?? "null");
       return { ...defaults, ...(saved && typeof saved === "object" ? saved : {}) };
     } catch (_) {
       return { ...defaults };
@@ -70,6 +83,7 @@ export const svkSettingsStore = createStore("svk-sim-settings", {
   scanlines:      true,          // faint CRT scanline texture behind the page
   defaultDestIp:  "127.0.0.1",   // UDP / HTTP destination used at start-up
   defaultRadio:   1,             // Radio1 (0xF1 SoF) or Radio2 (0xF2 SoF)
+  locoStyle:      "classic",     // 🚆 LIVE TRACK loco icon (see LocoStyles.jsx)
 });
 
 export const svkSessionStore = createStore(null, {
@@ -106,12 +120,25 @@ export const soundSettingsStore = createStore("pinj-sound-settings", {
   sosOnTrack:      true,   // buzzer for loco EMERGENCY_STATUS on 🚆 LIVE TRACK
   brakeOnLive:     true,   // brake beeps for Brake_Applied on the 📡 LIVE page
   brakeOnTrack:    true,   // brake beeps for brake dots on 🚆 LIVE TRACK
+  modeOnLive:      true,   // beep on the 📡 LIVE page when a loco's LOCO_MODE changes
   brakeIndication: "beep", // brake indication: "beep" (synth beeps) OR "voice" (recordings) — one at a time
   voiceVolume:     1,      // 0 … 1 (own volume — recordings are usually quieter than beeps)
   voiceOverspeed:  true,
   voiceNSB:        true,
   voiceFSB:        true,
   voiceEB:         true,
+  cuesEnabled:     true,   // 🗣 route announcements (signal / turnout / PSR) on the 📡 LIVE feed
+  cueVolume:       1,      // 0 … 1
+  cueSignalRepeatS: 10,    // repeat Danger / Attention / Caution this often until the signal is passed (0 = once)
+  cueProfileRepeatS: 10,   // repeat Approaching Turnout / PSR this often until it is entered (0 = once)
+  cueDanger:       true,
+  cueAttention:    true,
+  cueCaution:      true,
+  cueProceed:      true,
+  cueApproachTO:   true,
+  cueEnterTO:      true,
+  cueApproachPSR:  true,
+  cueEnterPSR:     true,
 });
 
 /* Tone of each brake type — higher and more urgent for a heavier brake.
@@ -144,6 +171,13 @@ export const SOS_SOUNDS = {
     desc: "Roll back · foreign RFID · odometer error ≥ 120 m · shunting limit — two long low buzzes.",
     tones: [{ f: 440, d: 0.6, g: 0.35 }, { f: 440, d: 0.6, g: 0 }],
   },
+};
+
+/* Mode change (📡 LIVE): two short rising beeps — the lowest priority, so it never cuts off a
+   brake beep or SOS buzzer (they replace it). */
+export const MODE_SOUND = {
+  key: "modeOnLive", prio: 0, short: "MODE", name: "Mode change",
+  tones: [{ f: 988, d: 0.12, g: 0.06 }, { f: 1319, d: 0.16, g: 0 }],
 };
 
 /** Which SOS buzzer a field value belongs to (null = no buzzer). */
@@ -189,11 +223,22 @@ export const VOICE_CLIPS = {
   3: { key: "voiceFSB",       short: "FSB",       name: "Full Service Brake",   file: "brake-fsb" },
   4: { key: "voiceEB",        short: "EB",        name: "Emergency Brake",      file: "brake-eb" },
 };
+/* 🗣 Route announcements (recorded by the user), same folder: cue-*.mp3 */
+export const VOICE_CUES = {
+  danger:          { key: "cueDanger",      short: "DANGER",      name: "Approaching a Red signal",          file: "cue-danger" },
+  attention:       { key: "cueAttention",   short: "ATTENTION",   name: "Approaching a Double Yellow signal", file: "cue-attention" },
+  caution:         { key: "cueCaution",     short: "CAUTION",     name: "Approaching a Yellow signal",       file: "cue-caution" },
+  proceed:         { key: "cueProceed",     short: "PROCEED",     name: "Approaching a Green signal",        file: "cue-proceed" },
+  enteredTurnout:  { key: "cueEnterTO",     short: "ENTERED TURNOUT",     name: "Entered the turnout section",  file: "cue-entered-turnout" },
+  enteredPsr:      { key: "cueEnterPSR",    short: "ENTERED PSR",         name: "Entered the PSR section",      file: "cue-entered-psr" },
+  approachTurnout: { key: "cueApproachTO",  short: "APPROACHING TURNOUT", name: "Approaching a turnout",        file: "cue-approaching-turnout" },
+  approachPsr:     { key: "cueApproachPSR", short: "APPROACHING PSR",     name: "Approaching a PSR",            file: "cue-approaching-psr" },
+};
 let voiceUrls = {};                       // code → found URL, or null when missing
 /** URL of the recording for a brake code (null if no file is there). */
 export async function findVoiceUrl(code) {
   if (code in voiceUrls) return voiceUrls[code];
-  const clip = VOICE_CLIPS[code];
+  const clip = VOICE_CLIPS[code] || VOICE_CUES[code];
   let found = null;
   if (clip) {
     for (const ext of VOICE_EXTS) {
@@ -208,7 +253,63 @@ export async function findVoiceUrl(code) {
   return found;
 }
 /** Forget the file look-ups (after adding / replacing recordings). */
-export function recheckVoiceFiles() { voiceUrls = {}; }
+export function recheckVoiceFiles() { voiceUrls = {}; startupUrl = undefined; }
+
+/* 🎵 Start-up sound: your recording frontend/public/sounds/startup.(mp3|wav|m4a|ogg) if it is
+   there, otherwise the synthesised start-up chime. */
+export const STARTUP_FILE = "/sounds/startup";
+let startupUrl;                           // undefined = not looked up yet, null = no file
+async function findStartupUrl() {
+  if (startupUrl !== undefined) return startupUrl;
+  startupUrl = null;
+  for (const ext of VOICE_EXTS) {
+    try {
+      const r = await fetch(STARTUP_FILE + ext, { method: "HEAD", cache: "no-store" });
+      // the dev server answers unknown paths with index.html — only accept real audio
+      if (r.ok && (r.headers.get("content-type") || "").startsWith("audio/")) { startupUrl = STARTUP_FILE + ext; break; }
+    } catch (_) { /* offline / blocked */ }
+  }
+  return startupUrl;
+}
+function playStartupChime() {
+  try {
+    const ctx = new (window.AudioContext || window.webkitAudioContext)();
+    const tone = (freq, start, dur, type = "sawtooth", gain = 0.15) => {
+      const osc = ctx.createOscillator();
+      const g   = ctx.createGain();
+      osc.type = type;
+      osc.frequency.setValueAtTime(freq, start);
+      g.gain.setValueAtTime(0, start);
+      g.gain.linearRampToValueAtTime(gain, start + 0.01);
+      g.gain.exponentialRampToValueAtTime(0.001, start + dur);
+      osc.connect(g); g.connect(ctx.destination);
+      osc.start(start); osc.stop(start + dur);
+    };
+    const t = ctx.currentTime;
+    // Rising scan sweep
+    tone(180,  t,        0.08, "square",   0.10);
+    tone(360,  t + 0.08, 0.06, "square",   0.09);
+    tone(720,  t + 0.14, 0.06, "square",   0.11);
+    tone(1440, t + 0.20, 0.04, "square",   0.13);
+    // Deep power thud
+    tone(55,   t + 0.22, 0.20, "sine",     0.20);
+    // Sharp confirm beeps
+    tone(2200, t + 0.26, 0.07, "sine",     0.16);
+    tone(3000, t + 0.30, 0.05, "sine",     0.12);
+    // Final warm power-up hum
+    tone(440,  t + 0.34, 0.30, "sawtooth", 0.07);
+    tone(880,  t + 0.36, 0.25, "sawtooth", 0.05);
+  } catch (_) { /* AudioContext unavailable */ }
+}
+/** Play the start-up sound (⚙ Settings → 🔊 SOUND → APP SOUNDS). Returns "file" or "chime". */
+export async function playStartupSound() {
+  const url = await findStartupUrl();
+  if (url) {
+    try { await new Audio(url).play(); return "file"; } catch (_) { /* blocked / unreadable → chime */ }
+  }
+  playStartupChime();
+  return "chime";
+}
 
 let current = null;                       // the alert now waiting / playing: { prio, nodes, audio, timer }
 /** Stop whatever alert is waiting / sounding (e.g. the alert pop-up was closed). */
@@ -274,13 +375,13 @@ function playTones(prio, tones, { wave, cutoff, gain, delayMs = 0, test = false 
 }
 
 /* Play a recording inside an alert; then() runs when it ends (or fails). */
-function playVoice(me, url, then) {
+function playVoice(me, url, then, volKey = "voiceVolume") {
   const cfg = soundSettingsStore.get();
   let over = false;
   const fin = () => { if (!over) { over = true; if (current === me) then(); } };
   try {
     const a = new Audio(url);
-    a.volume = Math.max(0, Math.min(1, Number(cfg.voiceVolume) || 0));
+    a.volume = Math.max(0, Math.min(1, Number(cfg[volKey]) || 0));
     a.onended = fin;
     a.onerror = fin;
     me.audio = a;
@@ -330,6 +431,43 @@ export async function playVoiceTest(code) {
   return startAlert(99, 0, true, me => playVoice(me, url, () => done(me)));
 }
 
+/* Route announcements play one after another. They rank above the mode-change beep and below
+   every brake / SOS sound, which cut them off; what is waiting then plays after that sound. */
+const CUE_PRIO = 1, CUE_MAX_WAIT_MS = 12000;
+let cueQueue = [], cueTimer = null;
+function pumpCues() {
+  clearTimeout(cueTimer);
+  cueTimer = null;
+  cueQueue = cueQueue.filter(c => Date.now() - c.at < CUE_MAX_WAIT_MS);
+  if (!cueQueue.length) return;
+  if (!current) {
+    const { id } = cueQueue.shift();
+    startAlert(CUE_PRIO, 0, false, async me => {
+      const url = await findVoiceUrl(id);
+      if (current !== me) return;
+      if (!url) { done(me); pumpCues(); return; }
+      playVoice(me, url, () => { done(me); pumpCues(); }, "cueVolume");
+    });
+  }
+  if (cueQueue.length) cueTimer = setTimeout(pumpCues, 250);
+}
+/** Queue route announcements (ids of VOICE_CUES), honouring ⚙ → 🔊 SOUND → ROUTE ANNOUNCEMENTS. */
+export function queueVoiceCues(ids) {
+  const cfg = soundSettingsStore.get();
+  if (!cfg.enabled || !cfg.cuesEnabled) return;
+  ids.forEach(id => {
+    const cue = VOICE_CUES[id];
+    if (cue && cfg[cue.key] && !cueQueue.some(c => c.id === id)) cueQueue.push({ id, at: Date.now() });
+  });
+  pumpCues();
+}
+/** ▶ PLAY of an announcement in ⚙ Settings (ignores the switches). false = no file. */
+export async function playCueTest(id) {
+  const url = await findVoiceUrl(id);
+  if (!url) return false;
+  return startAlert(99, 0, true, me => playVoice(me, url, () => done(me), "cueVolume"));
+}
+
 /**
  * SOS buzzer. category: "collision" | "call" | "caution" (see sosCategory()).
  * source: "live" (📡 LIVE page) | "track" (🚆 LIVE TRACK) — each can be switched off.
@@ -346,6 +484,16 @@ export function playSosAlert(category, { source = "live", test = false } = {}) {
     snd.tones.forEach((t, i) => tones.push({ ...t, g: i === snd.tones.length - 1 && r < reps - 1 ? 0.9 : t.g }));
   }
   return playTones(snd.prio, tones, { wave: "sawtooth", cutoff: 2400, gain: 0.22, test });
+}
+
+/**
+ * Mode-change beep: a loco's LOCO_MODE changed (📡 LIVE). Plays at once; skipped while a brake
+ * beep / SOS buzzer is sounding. `test` = ▶ TEST in ⚙ Settings (ignores the switches).
+ */
+export function playModeAlert({ test = false } = {}) {
+  const cfg = soundSettingsStore.get();
+  if (!test && (!cfg.enabled || !cfg[MODE_SOUND.key])) return false;
+  return playTones(MODE_SOUND.prio, MODE_SOUND.tones, { wave: "sine", cutoff: 4000, gain: 0.45, test });
 }
 
 export function useStore(store) {
@@ -485,7 +633,11 @@ const TABS = [
   { id: "live",    icon: "📡", label: "LIVE" },
   { id: "svksim",  icon: "🧩", label: "SVK SIM" },
   { id: "sound",   icon: "🔊", label: "SOUND" },
+  { id: "profile", icon: "👤", label: "PROFILE" },
+  { id: "users",   icon: "👥", label: "USERS", admin: true },
+  { id: "library", icon: "📂", label: "LIBRARY", admin: true },
 ];
+const ACCOUNT_TABS = ["profile", "users", "library"];               // kept on the PINJ server, not in this browser
 
 /* 🗣 Voice-over rows — shows whether each recording was found in public/sounds/voice/ */
 function VoiceSection({ snd, setSnd, disabled }) {
@@ -523,8 +675,53 @@ function VoiceSection({ snd, setSnd, disabled }) {
   );
 }
 
+/* 🗣 Route announcement rows — same layout as the brake recordings above */
+function CueSection({ snd, setSnd }) {
+  const ids = Object.keys(VOICE_CUES);
+  const [files, setFiles] = useState({});               // id → url | null | undefined (checking)
+  const check = () => {
+    setFiles({});
+    ids.forEach(id => findVoiceUrl(id).then(u => setFiles(f => ({ ...f, [id]: u }))));
+  };
+  useEffect(check, []);
+  const found = Object.values(files).filter(Boolean).length;
+  return (
+    <Section title="🗣 ROUTE ANNOUNCEMENTS · 📡 LIVE" disabled={!snd.enabled} note={SOUND_OFF}>
+      <Row label="Route announcements" hint={"Spoken for each signal, turnout and PSR as the loco approaches and enters it. " + found + " of " + ids.length + " recordings found."}>
+        <Toggle checked={snd.cuesEnabled} onChange={v => setSnd("cuesEnabled", v)} />
+      </Row>
+      <Row label="Volume" hint={Math.round(snd.cueVolume * 100) + " %"}>
+        <input type="range" min={0} max={100} step={5} value={Math.round(snd.cueVolume * 100)}
+          onChange={e => setSnd("cueVolume", Number(e.target.value) / 100)}
+          style={{ width: 170, accentColor: "var(--green)", cursor: "pointer" }} />
+      </Row>
+      <Row label="Repeat the signal announcement every" hint="Danger, Attention, Caution and Proceed repeat while the moving loco approaches the signal, until it is passed.">
+        <Choice value={snd.cueSignalRepeatS} options={[[0, "OFF"], [5, "5 s"], [10, "10 s"], [15, "15 s"], [20, "20 s"]]} onChange={v => setSnd("cueSignalRepeatS", v)} />
+      </Row>
+      <Row label="Repeat the turnout / PSR announcement every" hint="Approaching Turnout and Approaching PSR repeat while the moving loco approaches, until it enters. Entered plays once.">
+        <Choice value={snd.cueProfileRepeatS} options={[[0, "OFF"], [5, "5 s"], [10, "10 s"], [15, "15 s"], [20, "20 s"]]} onChange={v => setSnd("cueProfileRepeatS", v)} />
+      </Row>
+      {ids.map(id => {
+        const c = VOICE_CUES[id];
+        const u = files[id];
+        const status = u === undefined ? "checking…" : u ? c.name + " · ✓ " + u.split("/").pop() : c.name + " · ✗ not found — add " + c.file + ".mp3 to frontend/public/sounds/voice/";
+        return (
+          <Row key={id} label={c.short}
+            hint={<span style={{ color: u === null ? "var(--amber-text)" : undefined }}>{status}</span>}>
+            <button className="sa-btn" disabled={!u} style={{ opacity: u ? 1 : 0.45, cursor: u ? "pointer" : "default" }}
+              onClick={() => playCueTest(id)} title={u ? "Play this recording" : "No recording yet"}>▶ PLAY</button>
+            <Toggle checked={snd[c.key]} onChange={v => setSnd(c.key, v)} />
+          </Row>
+        );
+      })}
+    </Section>
+  );
+}
+
 export function SettingsDialog({ initialTab = "general", isLight, setIsLight, onClose }) {
-  const [tab, setTab] = useState(TABS.some(t => t.id === initialTab) ? initialTab : "general");
+  const me = useCurrentUser();
+  const tabs = TABS.filter(t => !t.admin || me?.role === "admin");
+  const [tab, setTab] = useState(tabs.some(t => t.id === initialTab) ? initialTab : "general");
   const app = useStore(appSettingsStore);
   const svk = useStore(svkSettingsStore);
   const setApp = (k, v) => appSettingsStore.set({ [k]: v });
@@ -549,20 +746,27 @@ export function SettingsDialog({ initialTab = "general", isLight, setIsLight, on
 
   return (
     <Dialog title="SETTINGS" icon="⚙" width={820} onClose={onClose} footer={<>
-      <span style={{ fontSize: 9, color: "var(--text-secondary)", opacity: 0.85 }}>Saved automatically in this browser · Ctrl+, opens this window</span>
-      <button className="sa-btn" style={{ marginLeft: "auto" }} onClick={resetTab}>↺ RESET {TABS.find(t => t.id === tab).label}</button>
+      <span style={{ fontSize: 9, color: "var(--text-secondary)", opacity: 0.85 }}>
+        {ACCOUNT_TABS.includes(tab) ? "Kept on the PINJ server" : `Saved automatically for ${me?.username || "you"} in this browser`} · Ctrl+, opens this window</span>
+      {!ACCOUNT_TABS.includes(tab) &&
+        <button className="sa-btn" style={{ marginLeft: "auto" }} onClick={resetTab}>↺ RESET {TABS.find(t => t.id === tab).label}</button>}
+      {ACCOUNT_TABS.includes(tab) && <button className="sa-btn" style={{ marginLeft: "auto", color: "var(--red)" }} onClick={signOut}>⏻ SIGN OUT</button>}
       <button className="sa-btn primary" onClick={onClose}>✓ DONE</button>
     </>}>
       <div className="sa-body" style={{ display: "flex", flex: 1, minHeight: 0 }}>
         <div className="sa-nav" style={{ width: 180, flexShrink: 0, display: "flex", flexDirection: "column", gap: 4, padding: 10, borderRight: "1px solid var(--border)", background: "var(--bg-surface)" }}>
-          {TABS.map(t => (
-            <button key={t.id} className={"sa-nav-btn" + (tab === t.id ? " on" : "")} onClick={() => setTab(t.id)}>
+          {tabs.map(t => (
+            <button key={t.id} className={"sa-nav-btn" + (tab === t.id ? " on" : "")} onClick={() => setTab(t.id)}
+              style={t.id === "profile" ? { marginTop: 10, borderTop: "1px solid var(--border)", borderRadius: "0 0 6px 6px", paddingTop: 12 } : undefined}>
               <span style={{ width: 16, textAlign: "center" }}>{t.icon}</span>{t.label}
             </button>
           ))}
         </div>
 
         <div style={{ flex: 1, minWidth: 0, padding: "14px 16px", overflowY: "auto", display: "flex", flexDirection: "column", gap: 14 }}>
+          {tab === "profile" && <ProfilePanel />}
+          {tab === "users" && <UsersPanel />}
+          {tab === "library" && <LibraryAdminPanel />}
           {tab === "general" && <>
             <Section title="◐ APPEARANCE">
               <Row label="Theme" hint="Applies to every page — PINJ, LIVE and SVK SIM (same as the ☀ / ☾ switch in the top bar).">
@@ -715,13 +919,23 @@ export function SettingsDialog({ initialTab = "general", isLight, setIsLight, on
               </Row>
             </Section>
 
+            <Section title="🔁 MODE CHANGE · 📡 LIVE" disabled={!snd.enabled} note={SOUND_OFF}>
+              <Row label="Beep when the mode changes" hint="When a loco's LOCO_MODE in a received C.4.3 / C.4.6 differs from its previous packet (e.g. FS → SR) — two short rising beeps, per loco. A brake beep or SOS buzzer at the same moment takes over.">
+                <button className="sa-btn" onClick={() => playModeAlert({ test: true })} title="Play the mode-change beep now">▶ TEST</button>
+                <Toggle checked={snd.modeOnLive} onChange={v => setSnd("modeOnLive", v)} />
+              </Row>
+            </Section>
+
+            <CueSection snd={snd} setSnd={setSnd} />
+
             <Section title="🎵 APP SOUNDS · not affected by Sound alerts">
-              <Row label="Start-up sound" hint="The short chime played when the app loads (separate from the Kavach alert switch above).">
+              <Row label="Start-up sound" hint="Played when the app loads (separate from the Kavach alert switch above): your recording frontend/public/sounds/startup.mp3 (or .wav / .m4a / .ogg) if it is there, otherwise the short chime.">
+                <button className="sa-btn" onClick={() => playStartupSound()} title="Play the start-up sound now">▶ TEST</button>
                 <Toggle checked={app.bootSound} onChange={v => setApp("bootSound", v)} />
               </Row>
             </Section>
             <div style={{ fontSize: 9, color: "var(--text-secondary)", opacity: 0.8, lineHeight: 1.6 }}>
-              Priority: NSB → FSB → EB → Caution → SoS → Collision — a higher alert replaces a lower one that is still sounding; a lower one never cuts off a higher one. More Kavach sounds (horn, …) will be added to this tab.
+              Priority: Mode change → Route announcements → NSB → FSB → EB → Caution → SoS → Collision — a higher alert replaces a lower one that is still sounding; a lower one never cuts off a higher one. More Kavach sounds (horn, …) will be added to this tab.
             </div>
           </>}
 
@@ -736,6 +950,24 @@ export function SettingsDialog({ initialTab = "general", isLight, setIsLight, on
               <Row label="Close the drawer when a transmission starts" hint="Gives the live TX / serial log the full width while it runs.">
                 <Toggle checked={svk.autoHideOnTx} onChange={v => setSvk("autoHideOnTx", v)} />
               </Row>
+            </Section>
+            <Section title="🚆 LIVE TRACK">
+              <Row label="Loco icon" hint="How each loco is drawn on the 🚆 LIVE TRACK chart. Every style keeps the loco's own colour, spinning wheels, headlight, brake lights / sparks and the emergency beacon." />
+              <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(118px, 1fr))", gap: 6, padding: "0 12px 12px" }}>
+                {LOCO_STYLES.map(ls => {
+                  const on = (svk.locoStyle || "classic") === ls.id;
+                  return (
+                    <button key={ls.id} type="button" onClick={() => setSvk("locoStyle", ls.id)} aria-pressed={on} title={ls.name + " — " + ls.note}
+                      style={{ display: "flex", flexDirection: "column", alignItems: "center", gap: 3, padding: "6px 4px 7px", borderRadius: 6, cursor: "pointer",
+                        border: "1.5px solid " + (on ? "var(--cyan)" : "var(--border)"), background: on ? "var(--cyan-glow, rgba(34,211,238,.12))" : "var(--bg-raised)",
+                        color: on ? "var(--cyan)" : "var(--text-secondary)", fontFamily: "var(--font-mono)", transition: "border-color .15s, background .15s" }}>
+                      <span style={{ background: "#050910", borderRadius: 4, padding: "2px 4px" }}><LocoStylePreview style={ls.id} width={96} speed={on ? 70 : 0} /></span>
+                      <span style={{ fontSize: 9.5, fontWeight: 700 }}>{on ? "● " : ""}{ls.name}</span>
+                      <span style={{ fontSize: 8, opacity: .8 }}>{ls.note}</span>
+                    </button>
+                  );
+                })}
+              </div>
             </Section>
             <Section title="▤ STATIC DATA">
               <Row label="Show the table after a file loads" hint="Jumps to ▤ STATIC DATA when APD / MA / RFID tables are loaded (never during a running transmission).">
@@ -870,7 +1102,7 @@ export function AboutDialog({ onClose, page, packetTypes, isLight, session }) {
     let alive = true;
     const ctl = new AbortController();
     const t = setTimeout(() => ctl.abort(), 3000);
-    fetch("http://localhost:8000/health", { signal: ctl.signal })
+    fetch(API_BASE + "/health", { signal: ctl.signal })
       .then(r => { if (alive) setBackend(r.ok ? "online" : "offline"); })
       .catch(() => { if (alive) setBackend("offline"); })
       .finally(() => clearTimeout(t));
@@ -983,8 +1215,8 @@ export function AboutDialog({ onClose, page, packetTypes, isLight, session }) {
             <Section title="📡 LIVE — real-time feed">
               <Para><span style={{ display: "block", padding: "8px 12px 0" }}>Watch packets the moment they reach the backend — from the Packet Simulator, an external tool or the radio.</span></Para>
               <Steps items={[
-                <>Open <b>📡 LIVE</b>. The feed connects to <code>ws://localhost:8000/ws/live</code> and shows each packet as it arrives.</>,
-                <>External tools post packets to <code>POST http://localhost:8000/ingest</code>; the <b>Packet Simulator</b> (<code>/simulator</code>) does exactly this, field by field.</>,
+                <>Open <b>📡 LIVE</b>. The feed connects to <code>{WS_BASE}/ws/live</code> and shows each packet as it arrives.</>,
+                <>External tools post packets to <code>POST {API_BASE}/ingest</code>; the <b>Packet Simulator</b> (<code>/simulator</code>) does exactly this, field by field.</>,
                 <>SOS, emergency and brake values raise pop-up alerts with the matching buzzer, beeps or your voice (⚙ Settings → 🔊 SOUND).</>,
                 <>Filter by packet type and source (UDP/HTTP, serial TX, serial RX, simulator, log replay), pause / resume the feed, and switch <b>▤ PACKETS / 🚆 DMI / 🗺 PROFILE</b>.</>,
                 <>The <b>🚆 LIVE VISUALISER</b> strip shows the tags of the received C.4.2 tag list, the signal, the EoA and each loco moving on the track; <b>🚆 DMI</b> shows the onboard screen (see <i>LIVE DMI &amp; replay</i>).</>,
@@ -999,7 +1231,7 @@ export function AboutDialog({ onClose, page, packetTypes, isLight, session }) {
               <Steps items={[
                 <><b>SIMULATOR</b> — choose a packet type and the field values to inject, send once or automatically.</>,
                 <><b>DMI SIM</b> — drive loco and station values to exercise the DMI.</>,
-                <><b>📂 LOG REPLAY</b> — drop a PINJ log (<code>logs/svk_test_*.log</code>) or a KAVACH onboard <b>Event Log Viewer</b> log (<code>.txt</code> with <i>Event Name</i> / <i>Data</i> blocks; a leading <code>F1/F2 A5 C3</code> radio prefix is removed) and replay it to <code>/ingest</code> with its original timing (1× … 10×, FAST). Event-log replays are paced by each packet's FRAME_NUM; RFID Data events are shown, not sent.</>,
+                <><b>📂 LOG REPLAY</b> — drop a PINJ log (<code>logs/pinj_test_*.log</code>) or a KAVACH onboard <b>Event Log Viewer</b> log (<code>.txt</code> with <i>Event Name</i> / <i>Data</i> blocks; a leading <code>F1/F2 A5 C3</code> radio prefix is removed) and replay it to <code>/ingest</code> with its original timing (1× … 10×, FAST). Event-log replays are paced by each packet's FRAME_NUM; RFID Data events are shown, not sent.</>,
                 <>All three pages keep their state when you switch between them — a loaded log and a running replay continue. The theme follows the DECODEX tab (☀ / ☾ in either tab switches both).</>,
               ]} />
             </Section>
@@ -1147,7 +1379,7 @@ export function AboutDialog({ onClose, page, packetTypes, isLight, session }) {
               ["“Permission denied” on /dev/ttyUSB0", "sudo chmod 0777 /dev/ttyUSB0 after each attach, or join the dialout group once."],
               ["TEST PORT says “NOT CONNECTED — USING SIMULATION”", "The backend could not open the real device and fell back to the simulator — check the device path, the cable and that no other program holds the port."],
               ["CRC FAIL on a packet", "The payload was altered, truncated or its bytes are in the wrong order. Compare the hex with the source; the decoded fields still show what was received."],
-              ["LIVE shows no packets", "The LIVE status must read LIVE, not OFFLINE (it connects to ws://localhost:8000/ws/live). Tools must POST to /ingest; the Packet Simulator does this for you."],
+              ["LIVE shows no packets", `The LIVE status must read LIVE, not OFFLINE (it connects to ${WS_BASE}/ws/live). Tools must POST to /ingest; the Packet Simulator does this for you.`],
               ["No sound at all", "Click once anywhere on the page (browsers block audio until the first click), then check ⚙ → 🔊 SOUND → Sound alerts. LIVE TRACK sounds can be limited to when it is on screen."],
               ["Voice recording not playing", "⚙ → 🔊 SOUND → select 🗣 VOICE, press ↻ RE-CHECK; files go in frontend/public/sounds/voice/ (brake-overspeed / -nsb / -fsb / -eb)."],
               ["LIVE TRACK chart looks wrong after a new run", "Press ⟲ CLEAR — the next packets start a fresh chart (a new transmission does this automatically)."],
@@ -1168,9 +1400,9 @@ export function AboutDialog({ onClose, page, packetTypes, isLight, session }) {
             <Section title="⚙ BACKEND">
               <KV k="Status" v={be[0]} color={be[1]} />
               <KV k="Web app" v={window.location.origin + "  ·  Packet Simulator: " + window.location.origin + "/simulator"} />
-              <KV k="REST API" v="http://localhost:8000 — /decode · /health · /ingest · /live/* · /svk/*" />
+              <KV k="REST API" v={API_BASE + " — /decode · /health · /ingest · /live/* · /svk/*"} />
               <KV k="WebSockets" v="/ws/live (LIVE feed — one connection per page; the session, up to 3000 packets, is re-sent on connect) · /ws/serial_log (SVK SIM serial log)" />
-              <KV k="Encoder" v="svk_sim.c shared library through the FastAPI bridge (svk_sim_bridge.py)" />
+              <KV k="Encoder" v="svk_sim_py.py (pure-Python port of svk_sim.c, byte-identical) through the FastAPI bridge (svk_sim_bridge.py)" />
             </Section>
 
             <Section title="▤ THIS SESSION">
@@ -1202,7 +1434,7 @@ export function AboutDialog({ onClose, page, packetTypes, isLight, session }) {
    The dropdown is position:fixed because .kv-topbar clips overflow.
 ═══════════════════════════════════════════════════════════════ */
 const MENU_CSS = `
-  .kv-menu-btn { width: 34px; height: 30px; border-radius: 8px; display: inline-flex; align-items: center; justify-content: center;
+  .kv-menu-btn { position: relative; width: 34px; height: 30px; border-radius: 8px; display: inline-flex; align-items: center; justify-content: center;
     cursor: pointer; padding: 0; flex-shrink: 0; transition: all 0.18s;
     border: 1px solid rgba(255,255,255,0.12); background: rgba(255,255,255,0.04); color: #cbd5e1; }
   .kv-menu-btn svg { transition: transform 0.45s cubic-bezier(0.4,0,0.2,1); }
@@ -1281,6 +1513,15 @@ export function AppMenu({ isLight, setIsLight, backendOk, onSettings, onAbout })
     };
   }, [open]);
   const pick = fn => () => { setOpen(false); fn(); };
+  const me = useCurrentUser();
+  const [pending, setPending] = useState(0);
+  useEffect(() => {
+    if (me?.role !== "admin") return;
+    const poll = () => hub("/hub/users").then(r => setPending(r.pending || 0)).catch(() => { });
+    poll();
+    const t = setInterval(poll, 30000);
+    return () => clearInterval(t);
+  }, [me?.role]);
   const be = backendOk === true ? ["ONLINE", "var(--green)"] : backendOk === false ? ["OFFLINE", "var(--red)"] : ["CHECKING", "var(--amber)"];
 
   return (
@@ -1290,6 +1531,8 @@ export function AppMenu({ isLight, setIsLight, backendOk, onSettings, onAbout })
       <button ref={btnRef} onClick={toggle} className={"kv-menu-btn" + (open ? " open" : "")}
         title="Menu — Settings · Theme · About" aria-haspopup="menu" aria-expanded={open}>
         <GearIcon />
+        {pending > 0 && <span title={`${pending} account request(s) waiting`} style={{ position: "absolute", top: -3, right: -3, minWidth: 14, height: 14,
+          borderRadius: 7, background: "var(--amber)", color: "#000", fontSize: 8.5, fontWeight: 800, lineHeight: "14px", textAlign: "center", padding: "0 3px" }}>{pending}</span>}
       </button>
       {open && pos && (
         <div ref={menuRef} role="menu" className="kv-menu" style={{ position: "fixed", top: pos.top, right: pos.right, zIndex: 4000 }}>
@@ -1304,8 +1547,33 @@ export function AppMenu({ isLight, setIsLight, backendOk, onSettings, onAbout })
             </span>
           </div>
 
+          {me && (
+            <div className="kv-menu-group">
+              <div className="kv-menu-label">SIGNED IN AS</div>
+              <div className="kv-menu-row" style={{ alignItems: "center" }}>
+                <span className="kv-menu-ico">👤</span>
+                <span style={{ minWidth: 0 }}>
+                  <span style={{ display: "block", fontSize: 11, fontWeight: 800, color: "var(--text-primary)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{me.full_name}</span>
+                  <span style={{ display: "block", fontSize: 9, color: "var(--text-secondary)" }}>@{me.username} · {me.role}</span>
+                </span>
+              </div>
+              <button role="menuitem" className="kv-menu-item" onClick={pick(() => onSettings("profile"))}>
+                <span className="kv-menu-ico">✎</span>My profile
+              </button>
+              {me.role === "admin" && (
+                <button role="menuitem" className="kv-menu-item" onClick={pick(() => onSettings("users"))}>
+                  <span className="kv-menu-ico">👥</span>Users
+                  {pending > 0 && <span className="kv-menu-kbd" style={{ color: "var(--amber)", borderColor: "var(--amber)" }}>{pending} waiting</span>}
+                </button>
+              )}
+              <button role="menuitem" className="kv-menu-item" onClick={pick(signOut)} style={{ color: "var(--red)" }}>
+                <span className="kv-menu-ico">⏻</span>Sign out
+              </button>
+            </div>
+          )}
+
           <div className="kv-menu-group">
-            <button role="menuitem" className="kv-menu-item" onClick={pick(onSettings)}>
+            <button role="menuitem" className="kv-menu-item" onClick={pick(() => onSettings())}>
               <span className="kv-menu-ico">⚙</span>Settings<span className="kv-menu-kbd">Ctrl+,</span>
             </button>
             <button role="menuitem" className="kv-menu-item" onClick={pick(onAbout)}>

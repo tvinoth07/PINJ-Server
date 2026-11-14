@@ -27,8 +27,10 @@
  */
 
 import { useState, useRef, useCallback, useEffect, useMemo } from "react";
+import { API_BASE, WS_BASE } from "./apiBase";
 import LiveTrackProfile from "./LiveTrackProfile";
 import { svkSettingsStore, svkSessionStore, tagTableStore, useStore } from "./SettingsAbout";
+import { LibraryButton } from "./Library";
 
 /* ═══════════════════════════════════════════════════════════════════════════
  * GLOBAL STYLES
@@ -1191,7 +1193,8 @@ function XmlLoader({ label, icon, accentColor, onLoad, loading }) {
  * binary file upload, not a text paste, so there's no "or paste" textarea.
  * ═══════════════════════════════════════════════════════════════════════════ */
 function ApdLoader({ label = "Load APD", icon = "▤", accentColor = "amber", loading, error, loadedInfo, onLoad,
-                     kind = "Track Profile", buttonLabel = "LOAD TRACK PROFILE", hint = "Track Profile / APD workbook" }) {
+                     kind = "Track Profile", buttonLabel = "LOAD TRACK PROFILE", hint = "Track Profile / APD workbook",
+                     library = null }) {
   const [dragging, setDragging] = useState(false);
   const [fileName, setFileName] = useState(null);
   const [file,     setFile]     = useState(null);
@@ -1279,6 +1282,7 @@ function ApdLoader({ label = "Load APD", icon = "▤", accentColor = "amber", lo
         )}
       </div>
 
+      {library && <LibraryButton categories={library} title={label} onPick={pickFile} />}
       <div style={{ padding: "6px 10px 10px" }}>
         <ActionButton onClick={() => file && onLoad(file)} disabled={loading || !file} loading={loading} accentColor={accentColor} fullWidth>
           {loading ? "LOADING…" : isLoaded ? "⚡ LOAD A DIFFERENT FILE" : `⚡ ${buttonLabel}`}
@@ -1345,7 +1349,7 @@ function PasteArea({ value, onChange, placeholder, accentColor = "green", minHei
  * CSV LOADER PANEL
  * ═══════════════════════════════════════════════════════════════════════════ */
 
-function CsvLoader({ onTransmit, onStop, onPause, onResume, txPaused = false, txPauseInfo = null, txCsv = "", txState, txEncodeLoading, rawCsv, setRawCsv, destIp, setDestIp, radioId, setRadioId }) {
+function CsvLoader({ onFileName, onTransmit, onStop, onPause, onResume, txPaused = false, txPauseInfo = null, txCsv = "", txState, txEncodeLoading, rawCsv, setRawCsv, destIp, setDestIp, radioId, setRadioId }) {
   const [dragging,   setDragging]   = useState(false);
   const [fileName,   setFileName]   = useState(null);
   const [destPort,   setDestPort]   = useState("12345");
@@ -1355,7 +1359,7 @@ function CsvLoader({ onTransmit, onStop, onPause, onResume, txPaused = false, tx
 
   /* ── Read CSV/TXT as plain text ── */
   const readCsvFile = (file) => {
-    setFileName(file.name);
+    setFileName(file.name); onFileName?.(file.name);
     const reader = new FileReader();
     reader.onload = (e) => setRawCsv(e.target.result);
     reader.readAsText(file);
@@ -1364,7 +1368,7 @@ function CsvLoader({ onTransmit, onStop, onPause, onResume, txPaused = false, tx
   /* ── Read XLSX/XLS via SheetJS, convert sheet→CSV text ── */
   const readXlFile = async (file) => {
     setXlLoading(true);
-    setFileName(file.name);
+    setFileName(file.name); onFileName?.(file.name);
     try {
       const XLSX = await import("xlsx");   // bundled locally (node_modules/xlsx 0.20.3) — no internet needed
       const buf  = await file.arrayBuffer();
@@ -1394,7 +1398,7 @@ function CsvLoader({ onTransmit, onStop, onPause, onResume, txPaused = false, tx
 
   const handleTransmit = () => {
     if (!validatePort(destPort) || !rawCsv.trim()) return;
-    onTransmit({ csv: rawCsv, dest_ip: destIp || "127.0.0.1", dest_port: parseInt(destPort, 10), loop: false, radio_id: radioId });
+    onTransmit({ csv: rawCsv, name: fileName, dest_ip: destIp || "127.0.0.1", dest_port: parseInt(destPort, 10), loop: false, radio_id: radioId });
   };
 
   const isTransmitting = txState === "transmitting";
@@ -1439,8 +1443,9 @@ function CsvLoader({ onTransmit, onStop, onPause, onResume, txPaused = false, tx
         <div style={{ color: "var(--text-dim)", fontSize: 9, marginTop: 2, fontFamily: "var(--font-mono)" }}>or click · # comments skipped · XL auto-converted</div>
       </div>
 
+      <LibraryButton categories={["svk_story", "ovk_story"]} title="Load storyboard" onPick={readFile} />
       <div style={{ padding: "5px 10px 3px", fontSize: 9, color: "var(--text-dim)", fontFamily: "var(--font-mono)", letterSpacing: "0.08em" }}>— OR PASTE CSV —</div>
-      <PasteArea value={rawCsv} onChange={v => { setRawCsv(v); setFileName(null); }} placeholder={"#TDMASlot,pktType,pktLen,frameNum,...\n10,9,0,1,431,2,..."} accentColor="orange" minHeight={65} maxHeight={130} />
+      <PasteArea value={rawCsv} onChange={v => { setRawCsv(v); setFileName(null); onFileName?.(null); }} placeholder={"#TDMASlot,pktType,pktLen,frameNum,...\n10,9,0,1,431,2,..."} accentColor="orange" minHeight={65} maxHeight={130} />
 
       {/* ── Transmit config + single action button ── */}
       <div style={{
@@ -3075,7 +3080,7 @@ function ResultTab({ active, color, onClick, children }) {
 
 function SerialConfig({
   serialCfg, setSerialCfg,
-  availablePorts, portsLoading, portsError, pyserialHint, wslWarning, onRefreshPorts,
+  availablePorts, portsLoading, portsError, pyserialHint, wslWarning, onRefreshPorts, agentInfo = null,
   serialTxState, onSerialTransmit, onSerialStop, onSerialPause, onSerialResume, serialTxPaused = false, serialPauseInfo = null,
   serialTxCsv = "", serialResumeError = null,
   rawCsv, onPortTestResult, portTest,
@@ -3119,7 +3124,7 @@ function SerialConfig({
   const saveConfig = async () => {
     setSaving(true); setTestStatus(null);
     try {
-      const res = await fetch("http://localhost:8000/svk/serial_config", {
+      const res = await fetch(API_BASE + "/svk/serial_config", {
         method: "POST", headers: { "Content-Type": "application/json" },
         body: JSON.stringify(serialCfg),
       });
@@ -3137,11 +3142,11 @@ function SerialConfig({
   const testPort = async () => {
     setTestStatus(null); setTestMsg("");
     try {
-      await fetch("http://localhost:8000/svk/serial_config", {
+      await fetch(API_BASE + "/svk/serial_config", {
         method: "POST", headers: { "Content-Type": "application/json" },
         body: JSON.stringify(serialCfg),
       });
-      const res  = await fetch("http://localhost:8000/svk/serial_test", { method: "POST" });
+      const res  = await fetch(API_BASE + "/svk/serial_test", { method: "POST" });
       const body = await res.json();
       if (!res.ok) throw new Error(body.detail || "Test failed");
       setTestStatus("ok");
@@ -3198,14 +3203,26 @@ function SerialConfig({
           <div style={{ display: "flex", gap: 5 }}>
             <select value={serialCfg.tty_device} onChange={e => handlePortChange(e.target.value)}
               style={{ flex: 1, background: "var(--bg-input)", border: "1px solid var(--border)", borderRadius: 4, color: "var(--text-primary)", fontFamily: "var(--font-mono)", fontSize: 10, padding: "5px 8px", outline: "none" }}>
-              {(availablePorts || []).some(p => !p.sim) && (
-                <optgroup label="REAL PORTS DETECTED">
-                  {(availablePorts || []).filter(p => !p.sim).map(p => (
+              {(availablePorts || []).some(p => !p.sim && p.agent) && (
+                <optgroup label="MODEM ON YOUR PC (PINJ MODEM AGENT)">
+                  {(availablePorts || []).filter(p => !p.sim && p.agent).map(p => (
                     <option key={p.device} value={p.device}>
                       {p.device}{p.description ? ` · ${p.description}` : ""}
                     </option>
                   ))}
                 </optgroup>
+              )}
+              {(availablePorts || []).some(p => !p.sim && !p.agent) && (
+                <optgroup label="PORTS OF THE PINJ SERVER PC">
+                  {(availablePorts || []).filter(p => !p.sim && !p.agent).map(p => (
+                    <option key={p.device} value={p.device}>
+                      {p.device}{p.description ? ` · ${p.description}` : ""}
+                    </option>
+                  ))}
+                </optgroup>
+              )}
+              {!(availablePorts || []).some(p => p.device === serialCfg.tty_device) && serialCfg.tty_device && (
+                <option value={serialCfg.tty_device}>{serialCfg.tty_device} (not available now)</option>
               )}
               <optgroup label="SIMULATION">
                 {(availablePorts || []).filter(p => p.sim).map(p => (
@@ -3218,6 +3235,18 @@ function SerialConfig({
               {portsLoading ? <Spinner size={10}/> : "↺"}
             </button>
           </div>
+
+          {/* Multi-user PINJ: the modem plugged into the user's own PC comes through the PINJ Modem Agent */}
+          {agentInfo && (
+            <div style={{ marginTop: 5, padding: "5px 8px", borderRadius: 4, fontSize: 8.5, fontFamily: "var(--font-mono)", lineHeight: 1.6,
+              border: "1px solid " + (agentInfo.online ? "var(--green-deep)" : "var(--border-bright)"),
+              background: agentInfo.online ? "var(--green-glow)" : "var(--bg-input)",
+              color: agentInfo.online ? "var(--green)" : "var(--text-secondary)" }}>
+              {agentInfo.online
+                ? <>● PINJ Modem Agent running on <b>{agentInfo.hostname}</b> · {(agentInfo.ports || []).length} port(s). Pick an <b>AGENT:…</b> port above.</>
+                : <>○ PINJ Modem Agent not running. To use the modem plugged into <b>your</b> PC: ⚙ menu → My profile → <b>MODEM AGENT</b> → download, run <b>PINJ_AGENT.bat</b>, then press ↺.</>}
+            </div>
+          )}
 
           {/* Why the real cable might not be showing up */}
           {pyserialHint && (
@@ -3234,11 +3263,11 @@ function SerialConfig({
           )}
           {!pyserialHint && !wslWarning && portsError && portsError !== "no_ports" && (
             <div style={{ marginTop: 5, padding: "5px 8px", borderRadius: 4, border: "1px solid var(--red)", background: "var(--red-glow)", fontSize: 8, fontFamily: "var(--font-mono)", color: "var(--red)", lineHeight: 1.6 }}>
-              ✖ Can't reach svk_sim_bridge.py at localhost:8000 ({portsError}).<br/>
+              ✖ Can't reach the PINJ backend at {API_BASE} ({portsError}).<br/>
               Confirm the Python backend is running and reachable — CORS or a wrong host/port will also land here.
             </div>
           )}
-          {!pyserialHint && !wslWarning && portsError === "no_ports" && (
+          {!pyserialHint && !wslWarning && portsError === "no_ports" && !agentInfo && (
             <div style={{ marginTop: 5, padding: "5px 8px", borderRadius: 4, border: "1px solid var(--amber)", background: "var(--amber-glow)", fontSize: 8, fontFamily: "var(--font-mono)", color: "var(--amber-text)", lineHeight: 1.6 }}>
               ⚠ Backend is up and pyserial is installed, but reports 0 real serial ports.<br/>
               Device Manager seeing the adapter only confirms Windows has a driver for it — the backend still enumerates independently. Check: the CH340/FTDI/PL2303 VCP driver is bound to a COM port, and no other program (e.g. another instance of this backend, or a terminal program) already has that COM port open.
@@ -4099,6 +4128,9 @@ export default function SvkSim() {
   // that must not be re-created on every keystroke.
   const rawCsvRef = useRef(rawCsv);
   rawCsvRef.current = rawCsv;
+  // File name of that storyboard (null when pasted) — sent with TRANSMIT / resume so the
+  // test .log file is named after it (pinj_test_…_<storyboard>.log)
+  const rawCsvNameRef = useRef(null);
   // The storyboard each running transmission is actually sending. If the
   // loaded storyboard differs from it while paused, RESUME switches the
   // running session over to the new one (same session / log).
@@ -4126,6 +4158,7 @@ export default function SvkSim() {
     parity: "N", read_timeout_s: 0.25, write_timeout_s: 1.0,
     tx_mode: "DOX", dox_delay: 6,
   });
+  const [agentInfo, setAgentInfo] = useState(null);   // multi-user PINJ: this user's PINJ Modem Agent
   const [availablePorts, setAvailablePorts] = useState([
     { device: "SIM_LOOPBACK", description: "Simulation / Loopback (no hardware)", sim: true },
   ]);
@@ -4182,7 +4215,7 @@ export default function SvkSim() {
 
   /* Load saved serial config + port list from server on mount */
   useEffect(() => {
-    fetch("http://localhost:8000/svk/serial_config")
+    fetch(API_BASE + "/svk/serial_config")
       .then(r => r.ok ? r.json() : null)
       .then(b => { if (b?.config) setSerialCfg(c => ({ ...c, ...b.config })); })
       .catch(() => {});
@@ -4194,7 +4227,7 @@ export default function SvkSim() {
   const refreshPorts = async () => {
     setPortsLoading(true);
     try {
-      const r = await fetch("http://localhost:8000/svk/serial_ports");
+      const r = await fetch(API_BASE + "/svk/serial_ports");
       if (!r.ok) throw new Error(`Backend returned HTTP ${r.status}`);
       const b = await r.json();
       const real = (b.ports || []).filter(p => !p.sim);
@@ -4208,6 +4241,7 @@ export default function SvkSim() {
       setPortsError(real.length ? null : "no_ports");
       setPyserialHint(b.available === false ? (b.pyserial_hint || "pyserial not installed") : null);
       setWslWarning(!!b.is_wsl && real.length === 0);
+      setAgentInfo(b.agent || null);
 
       /* Now that manual free-text entry is gone, the selected device can
        * only ever get out of sync with reality here: a previously-selected
@@ -4255,7 +4289,7 @@ export default function SvkSim() {
 
     const connect = () => {
       if (unmounted) return;
-      ws = new WebSocket("ws://localhost:8000/ws/serial_log");
+      ws = new WebSocket(WS_BASE + "/ws/serial_log");
       serialWsRef.current = ws;
 
       ws.onmessage = (e) => {
@@ -4330,9 +4364,9 @@ export default function SvkSim() {
     serialTxCsvRef.current = cfg.csv; setSerialTxCsv(cfg.csv); setSerialResumeError(null);
     setActiveView("serial");     // SERIAL view = the serial log (tables are under ▤ STATIC DATA)
     try {
-      const res = await fetch("http://localhost:8000/svk/serial_transmit", {
+      const res = await fetch(API_BASE + "/svk/serial_transmit", {
         method: "POST", headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ csv: cfg.csv, loop: cfg.loop || false, radio_id: cfg.radio_id || 1 }),
+        body: JSON.stringify({ csv: cfg.csv, name: cfg.name ?? rawCsvNameRef.current, loop: cfg.loop || false, radio_id: cfg.radio_id || 1 }),
       });
       if (!res.ok) {
         const b = await res.json();
@@ -4348,7 +4382,7 @@ export default function SvkSim() {
   }, []);
 
   const handleSerialStop = useCallback(async () => {
-    try { await fetch("http://localhost:8000/svk/serial_stop", { method: "POST" }); } catch (_) {}
+    try { await fetch(API_BASE + "/svk/serial_stop", { method: "POST" }); } catch (_) {}
     setSerialTxState("stopped");
     setSerialTxPaused(false); setSerialPauseInfo(null);
   }, []);
@@ -4359,7 +4393,7 @@ export default function SvkSim() {
   const handleSerialPause = useCallback(async () => {
     setSerialTxPaused(true);
     try {
-      const r = await fetch("http://localhost:8000/svk/serial_pause", { method: "POST" });
+      const r = await fetch(API_BASE + "/svk/serial_pause", { method: "POST" });
       if (!r.ok) setSerialTxPaused(false);
     } catch (_) { setSerialTxPaused(false); }
   }, []);
@@ -4372,9 +4406,9 @@ export default function SvkSim() {
     const swap = loaded.trim() && loaded !== serialTxCsvRef.current;
     setSerialResumeError(null);
     try {
-      const r = await fetch("http://localhost:8000/svk/serial_resume", {
+      const r = await fetch(API_BASE + "/svk/serial_resume", {
         method: "POST", headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(swap ? { csv: loaded } : {}),
+        body: JSON.stringify(swap ? { csv: loaded, name: rawCsvNameRef.current } : {}),
       });
       if (!r.ok) {
         const b = await r.json().catch(() => ({}));
@@ -4637,7 +4671,7 @@ export default function SvkSim() {
   const parseStation = useCallback(async (xml) => {
     setStationLoading(true); setStationError(null);
     try {
-      const res  = await fetch("http://localhost:8000/svk/parse_station", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ xml }) });
+      const res  = await fetch(API_BASE + "/svk/parse_station", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ xml }) });
       const body = await res.json();
       if (!res.ok) throw new Error(body.detail || "Parse failed");
       setStationResult(body.data);
@@ -4656,7 +4690,7 @@ export default function SvkSim() {
     try {
       const form = new FormData();
       form.append("file", file);
-      const res  = await fetch("http://localhost:8000/svk/load_track_profile", { method: "POST", body: form });
+      const res  = await fetch(API_BASE + "/svk/load_track_profile", { method: "POST", body: form });
       const body = await res.json();
       if (!res.ok) throw new Error(body.detail || "Track Profile load failed");
       setApdResult(body);
@@ -4679,7 +4713,7 @@ export default function SvkSim() {
     try {
       const form = new FormData();
       form.append("file", file);
-      const res  = await fetch("http://localhost:8000/svk/load_ma_table", { method: "POST", body: form });
+      const res  = await fetch(API_BASE + "/svk/load_ma_table", { method: "POST", body: form });
       const body = await res.json();
       if (!res.ok) throw new Error(body.detail || "MA table load failed");
       setMaResult(body);
@@ -4784,7 +4818,7 @@ export default function SvkSim() {
     setTxState("transmitting");
     let encodedData = null;
     try {
-      const res  = await fetch("http://localhost:8000/svk/encode_storyboard_csv", {
+      const res  = await fetch(API_BASE + "/svk/encode_storyboard_csv", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ csv: cfg.csv, radio_id: cfg.radio_id || 1 }),
@@ -4870,7 +4904,7 @@ export default function SvkSim() {
         pkts
           .filter(p => !p.error)
           .map(p =>
-            fetch("http://localhost:8000/live/inject", {
+            fetch(API_BASE + "/live/inject", {
               method: "POST",
               headers: { "Content-Type": "application/json" },
               body: JSON.stringify({
@@ -4913,7 +4947,7 @@ export default function SvkSim() {
      * Best-effort: errors are silently ignored.
      */
     if (cfg.dest_ip !== "127.0.0.1" || Number(cfg.dest_port) !== 12345) {
-      fetch("http://localhost:8000/svk/transmit_storyboard_csv", {
+      fetch(API_BASE + "/svk/transmit_storyboard_csv", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(cfg),
@@ -4930,7 +4964,7 @@ export default function SvkSim() {
     const loaded = rawCsvRef.current;
     if (loaded.trim() && loaded !== txCsvRef.current) {
       try {
-        const res  = await fetch("http://localhost:8000/svk/encode_storyboard_csv", {
+        const res  = await fetch(API_BASE + "/svk/encode_storyboard_csv", {
           method: "POST", headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ csv: loaded, radio_id: radioId || 1 }),
         });
@@ -4954,7 +4988,7 @@ export default function SvkSim() {
     setTxState("stopped");
     clearInterval(txTimerRef.current);
     clearInterval(txCounterRef.current);
-    try { await fetch("http://localhost:8000/svk/transmit_stop", { method: "POST" }); } catch (_) {}
+    try { await fetch(API_BASE + "/svk/transmit_stop", { method: "POST" }); } catch (_) {}
   }, []);
 
   /* When TX state goes to done/stopped/error but not idle, show TX panel;
@@ -5095,7 +5129,7 @@ export default function SvkSim() {
           overflowY: "auto", overflowX: "hidden", minHeight: 0,
         }}>
           {/* ① Track Profile (APD) — replaces the old "Load Station XML" slot */}
-          <ApdLoader label="Load APD" icon="▤" accentColor="amber" loading={apdLoading} error={apdError} loadedInfo={apdResult} onLoad={loadApd} />
+          <ApdLoader label="Load APD" icon="▤" accentColor="amber" loading={apdLoading} error={apdError} loadedInfo={apdResult} onLoad={loadApd} library={["apd"]} />
           <ErrorAlert message={apdError} />
 
           {/* ①b MA-from-RFID table (SKP_MA_PINJ.xlsx) — real-time Movement
@@ -5109,7 +5143,7 @@ export default function SvkSim() {
           <ApdLoader
             label="Load MA Table" icon="⇄" accentColor="cyan"
             loading={maLoading} error={maError} loadedInfo={maResult} onLoad={loadMaTable}
-            kind="MA (from RFID)" buttonLabel="LOAD MA TABLE"
+            kind="MA (from RFID)" buttonLabel="LOAD MA TABLE" library={["ma"]}
             hint="SKP_MA_PINJ.xlsx — S.No, LAST_RFID_TAG, MA (+ optional distPktStart, curSigInfo, curSigAsp, nxtSigAsp, apprSigDist)"
           />
           <ErrorAlert message={maError} />
@@ -5142,13 +5176,14 @@ export default function SvkSim() {
           <ApdLoader
             label="Load RFID Tag Table" icon="📍" accentColor="green"
             loading={rfidTagLoading} error={rfidTagError} loadedInfo={rfidTagResult} onLoad={loadRfidTagTable}
-            kind="RFID Tag Location" buttonLabel="LOAD RFID TAG TABLE"
+            kind="RFID Tag Location" buttonLabel="LOAD RFID TAG TABLE" library={["tag"]}
             hint="S.No, RFID Tag, RFID Tag Location"
           />
           <ErrorAlert message={rfidTagError} />
 
           {/* ② StoryBoard CSV */}
           <CsvLoader
+            onFileName={n => { rawCsvNameRef.current = n; }}
             onTransmit={transmitCsv}
             onStop={stopTransmit}
             onPause={pauseTransmit}
@@ -5172,6 +5207,7 @@ export default function SvkSim() {
             serialCfg={serialCfg}
             setSerialCfg={setSerialCfg}
             availablePorts={availablePorts}
+            agentInfo={agentInfo}
             portsLoading={portsLoading}
             portsError={portsError}
             pyserialHint={pyserialHint}
