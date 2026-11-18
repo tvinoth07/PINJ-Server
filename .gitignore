@@ -11,6 +11,7 @@ __pycache__/
 # run data: user accounts, sessions, benches, uploaded files, console token, library settings
 data/
 logs/
+library/
 
 # MySQL connection settings — contains the database password (made by SETUP_DATABASE.bat)
 backend/pinj_db.json

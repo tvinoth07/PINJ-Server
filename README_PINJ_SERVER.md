@@ -93,6 +93,43 @@ Good to know:
 - PINJ uses plain HTTP inside your network, so use it only on a trusted network. HTTPS can be added later.
 - Tools that post packets to `/ingest` now need a signed-in user.
 
+## Move PINJ to another PC (pen drive) and keep it always on
+
+**On this PC:** run **`MOVE_TO_NEW_PC.bat`** and give the pen-drive folder, e.g. `E:\PINJ` (about 80 MB).
+It copies:
+- the program, the built pages and the git history;
+- logs and everyone's My Files;
+- the accounts, exported to `data\pinj_users.sqlite` (passwords stay the same);
+- the PINJ LIBRARY input files, into `library\`.
+
+It leaves out `.venv`, `node_modules` and `backend\pinj_db.json` (this PC's MySQL password). Nothing on this PC
+changes.
+
+**On the new PC:**
+1. Copy the folder to a fixed place, e.g. `C:\PINJ`. Keep it out of Downloads and off the pen drive.
+2. Right-click **`INSTALL_SERVER.bat`** → **Run as administrator**. It does the following:
+   - checks Python and offers to install Python 3.12;
+   - installs the packages (internet needed once);
+   - opens the firewall for TCP 8080;
+   - points the library at `library\`;
+   - asks to keep the PC awake;
+   - asks to put the accounts into MySQL, if MySQL is installed;
+   - asks to make PINJ **always on**.
+3. Users sign in once more with their same passwords. Testers download their Modem Agent again.
+
+**Always on** (`PINJ_SERVICE.bat`): PINJ runs as a Windows task under SYSTEM.
+- It starts at every power-on, before anyone signs in.
+- It has no window, so it cannot be closed by mistake.
+- If it stops, it restarts within about 5 seconds.
+- Watch it and type commands with **`PINJ_MONITOR.bat`**.
+- Errors go to `logs\server\service.log`.
+
+For maintenance, open Command Prompt **as administrator** in the PINJ folder:
+- `PINJ_SERVICE.bat stop` stops PINJ. It stays stopped until `start`, or until the PC restarts.
+- `PINJ_SERVICE.bat start` starts it again.
+- `PINJ_SERVICE.bat status` shows whether it is installed and running.
+- `PINJ_SERVICE.bat remove` goes back to starting it by hand with `START_PINJ.bat`.
+
 ## What changed compared with the WSL PINJ
 
 | Area | WSL PINJ | This Windows PINJ |
