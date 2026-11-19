@@ -113,6 +113,8 @@ async def _lifespan(_app):
     import console                                       # noqa: PLC0415 — the server-window commands
     console.start(sys.modules[__name__])
     _new_console_token()
+    import users_report                                  # noqa: PLC0415 — PINJ_USERS.xlsx, the Excel view of the accounts
+    users_report.start_auto_refresh(store, A.say)
     yield
     for e in list(_engines.values()):
         stop_engine(e)

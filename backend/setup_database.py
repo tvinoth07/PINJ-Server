@@ -29,6 +29,9 @@ SQLITE_PATH = os.path.join(PROJECT, "data", "pinj_users.sqlite")
 
 
 def find_mysql() -> str:
+    if os.name != "nt":                                   # Ubuntu / Linux: the mysql client on PATH
+        import shutil                                     # noqa: PLC0415
+        return os.environ.get("PINJ_MYSQL_EXE", "") or shutil.which("mysql") or ""
     cands = [os.environ.get("PINJ_MYSQL_EXE", "")]
     for root in (os.environ.get("ProgramFiles", r"C:\Program Files"), os.environ.get("ProgramFiles(x86)", "")):
         base = os.path.join(root or "", "MySQL")
@@ -67,11 +70,17 @@ SELECT 'PINJ database ready' AS status;
         with os.fdopen(fd, "w", encoding="utf-8") as f:
             f.write(sql)
         print()
-        print("  Type the MySQL ROOT password when asked (it is the one you chose when installing MySQL).")
-        print("  It goes straight to mysql.exe — PINJ does not see or keep it.")
+        if os.name != "nt" and hasattr(os, "geteuid") and os.geteuid() == 0:
+            # Ubuntu's MySQL lets the Linux root user in as MySQL root through the local socket (auth_socket)
+            print("  Signing in to MySQL as root through the local socket (Ubuntu default) ...")
+            cmd = [mysql, "-u", "root", "--execute=source " + sql_path]
+        else:
+            print("  Type the MySQL ROOT password when asked (it is the one you chose when installing MySQL).")
+            print("  It goes straight to mysql — PINJ does not see or keep it.")
+            cmd = [mysql, "-u", "root", "-p", "-h", "localhost", "--protocol=TCP",
+                   "--execute=source " + sql_path.replace("\\", "/")]
         print()
-        r = subprocess.run([mysql, "-u", "root", "-p", "-h", "localhost", "--protocol=TCP",
-                            "--execute=source " + sql_path.replace("\\", "/")])
+        r = subprocess.run(cmd)
     finally:
         try:
             os.remove(sql_path)                    # it held the new pinj_app password

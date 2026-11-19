@@ -419,52 +419,86 @@ def run_command(cmd: str, feed: Feed, prompt: Prompt, state: dict) -> bool:
     return True
 
 
+def _key(ev: str, prompt: Prompt, feed: Feed, state: dict) -> bool:
+    """One key → prompt / page / scroll change. ev = 'up' 'down' 'pgup' 'pgdn' 'tab' 'stab' 'enter' 'bs' 'esc'
+    'ctrlc' or one printable character. False = quit."""
+    if ev == "up" and prompt.history:
+        prompt.hpos = max(0, prompt.hpos - 1)
+        prompt.text = prompt.history[prompt.hpos]
+    elif ev == "down" and prompt.history:
+        prompt.hpos = min(len(prompt.history), prompt.hpos + 1)
+        prompt.text = prompt.history[prompt.hpos] if prompt.hpos < len(prompt.history) else ""
+    elif ev == "pgup":
+        prompt.scroll = min(len(feed.general), prompt.scroll + 10)
+    elif ev == "pgdn":
+        prompt.scroll = max(0, prompt.scroll - 10)
+    elif ev in ("tab", "stab"):                          # Tab → next page, Shift+Tab → previous
+        prompt.page += 1 if ev == "tab" else -1
+        prompt.rotate_at = time.monotonic()
+    elif ev == "enter":
+        cmd = prompt.text.strip()
+        prompt.text = ""
+        prompt.scroll = 0
+        if cmd:
+            if not prompt.history or prompt.history[-1] != cmd:
+                prompt.history.append(cmd)
+            prompt.hpos = len(prompt.history)
+            if not run_command(cmd, feed, prompt, state):
+                return False
+    elif ev == "bs":
+        prompt.text = prompt.text[:-1]
+    elif ev == "esc":                                    # Esc clears; Esc twice on an empty line closes
+        now = time.monotonic()
+        if not prompt.text and now - prompt.esc_at < 0.8:
+            return False
+        prompt.text, prompt.esc_at = "", now
+    elif ev == "ctrlc":
+        return False
+    elif len(ev) == 1 and ev.isprintable() and len(prompt.text) < 200:
+        prompt.text += ev
+    return True
+
+
+_WIN_SPECIAL = {"H": "up", "P": "down", "I": "pgup", "Q": "pgdn", "\x0f": "stab"}
+_WIN_PLAIN = {"\t": "tab", "\r": "enter", "\x08": "bs", "\x1b": "esc", "\x03": "ctrlc"}
+
+
 def read_keys(prompt: Prompt, feed: Feed, state: dict) -> bool:
     """Windows console keys (msvcrt). False = quit."""
     import msvcrt                                        # noqa: PLC0415
     while msvcrt.kbhit():
         ch = msvcrt.getwch()
         if ch in ("\x00", "\xe0"):                       # arrows / page keys
-            k = msvcrt.getwch()
-            if k == "H" and prompt.history:              # ↑
-                prompt.hpos = max(0, prompt.hpos - 1)
-                prompt.text = prompt.history[prompt.hpos]
-            elif k == "P" and prompt.history:            # ↓
-                prompt.hpos = min(len(prompt.history), prompt.hpos + 1)
-                prompt.text = prompt.history[prompt.hpos] if prompt.hpos < len(prompt.history) else ""
-            elif k == "I":                               # PgUp
-                prompt.scroll = min(len(feed.general), prompt.scroll + 10)
-            elif k == "Q":                               # PgDn
-                prompt.scroll = max(0, prompt.scroll - 10)
-            elif k == "\x0f":                            # Shift+Tab → previous page
-                prompt.page -= 1
-                prompt.rotate_at = time.monotonic()
-            continue
-        if ch == "\t":                                   # Tab → next page
-            prompt.page += 1
-            prompt.rotate_at = time.monotonic()
-            continue
-        if ch == "\r":
-            cmd = prompt.text.strip()
-            prompt.text = ""
-            prompt.scroll = 0
-            if cmd:
-                if not prompt.history or prompt.history[-1] != cmd:
-                    prompt.history.append(cmd)
-                prompt.hpos = len(prompt.history)
-                if not run_command(cmd, feed, prompt, state):
-                    return False
-        elif ch == "\x08":
-            prompt.text = prompt.text[:-1]
-        elif ch == "\x1b":                               # Esc clears; Esc twice on an empty line closes
-            now = time.monotonic()
-            if not prompt.text and now - prompt.esc_at < 0.8:
+            ev = _WIN_SPECIAL.get(msvcrt.getwch())
+            if ev and not _key(ev, prompt, feed, state):
                 return False
-            prompt.text, prompt.esc_at = "", now
-        elif ch == "\x03":
+            continue
+        if not _key(_WIN_PLAIN.get(ch, ch), prompt, feed, state):
             return False
-        elif ch.isprintable() and len(prompt.text) < 200:
-            prompt.text += ch
+    return True
+
+
+_VT_SEQ = {"[A": "up", "[B": "down", "[5~": "pgup", "[6~": "pgdn", "[Z": "stab", "OA": "up", "OB": "down"}
+_VT_PLAIN = {"\t": "tab", "\r": "enter", "\n": "enter", "\x7f": "bs", "\x08": "bs", "\x03": "ctrlc"}
+
+
+def read_keys_posix(prompt: Prompt, feed: Feed, state: dict) -> bool:
+    """Linux / macOS terminal keys (stdin in cbreak mode, see main()). False = quit."""
+    import select                                        # noqa: PLC0415
+    while select.select([sys.stdin], [], [], 0)[0]:
+        ch = sys.stdin.read(1)
+        if ch == "\x1b":                                 # Esc alone, or the start of an arrow / page key
+            seq = ""
+            while select.select([sys.stdin], [], [], 0.02)[0] and len(seq) < 4:
+                seq += sys.stdin.read(1)
+                if seq[-1].isalpha() or seq[-1] == "~":
+                    break
+            ev = _VT_SEQ.get(seq) if seq else "esc"
+            if ev and not _key(ev, prompt, feed, state):
+                return False
+            continue
+        if not _key(_VT_PLAIN.get(ch, ch), prompt, feed, state):
+            return False
     return True
 
 
@@ -479,10 +513,26 @@ def main():
     feed.say(Text("  type  help  + Enter for commands · quit or Esc Esc closes this window (the server keeps running)",
                   style="grey50"))
     prompt, state = Prompt(), {"sending": False}
+    tty_saved = None
+    if os.name != "nt" and sys.stdin.isatty():           # Linux: keys one by one, no echo (restored on exit)
+        import termios                                   # noqa: PLC0415
+        import tty                                       # noqa: PLC0415
+        tty_saved = termios.tcgetattr(sys.stdin)
+        tty.setcbreak(sys.stdin.fileno())
+    try:
+        _run_live(console, feed, prompt, state)
+    finally:
+        if tty_saved is not None:
+            import termios                               # noqa: PLC0415
+            termios.tcsetattr(sys.stdin, termios.TCSADRAIN, tty_saved)
+
+
+def _run_live(console, feed: Feed, prompt: Prompt, state: dict):
+    keys = read_keys if os.name == "nt" else (read_keys_posix if sys.stdin.isatty() else None)
     with Live(render(feed, prompt, console, False), console=console, screen=True, auto_refresh=False) as live:
         last_draw = 0.0
         while True:
-            if os.name == "nt" and not read_keys(prompt, feed, state):
+            if keys and not keys(prompt, feed, state):
                 break
             feed.poll()
             now = time.monotonic()

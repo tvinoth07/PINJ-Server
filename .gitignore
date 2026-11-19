@@ -12,6 +12,9 @@ __pycache__/
 data/
 logs/
 library/
+PINJ_USERS.xlsx
+PINJ_USERS.xlsx.tmp
+pinj.conf
 
 # MySQL connection settings — contains the database password (made by SETUP_DATABASE.bat)
 backend/pinj_db.json

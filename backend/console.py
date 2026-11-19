@@ -369,6 +369,9 @@ def _save_settings():
 
 
 def c_monitor(args):
+    if os.name != "nt":
+        A.say("  on Ubuntu open the PINJ Monitor in a terminal:  ./pinj.sh monitor", "g")
+        return
     bat = os.path.join(H.PROJECT, "PINJ_MONITOR.bat")
     if not os.path.isfile(bat):
         raise ValueError(f"{bat} is missing")

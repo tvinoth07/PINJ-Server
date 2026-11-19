@@ -130,6 +130,51 @@ For maintenance, open Command Prompt **as administrator** in the PINJ folder:
 - `PINJ_SERVICE.bat status` shows whether it is installed and running.
 - `PINJ_SERVICE.bat remove` goes back to starting it by hand with `START_PINJ.bat`.
 
+### On an Ubuntu server instead of Windows
+
+PINJ-Server runs on Ubuntu 22.04 or newer with the same code. It was tested on Ubuntu 26.04: hub, sign-in, benches,
+SIM transmit, decode, library, Monitor.
+**One command does everything.** Copy the `PINJ` folder from the pen drive to its place, e.g.
+`/home/nmsremote/Documents/PINJ`. Then open a terminal from your normal account and run:
+
+```
+sudo bash /home/nmsremote/Documents/PINJ/install_server.sh
+```
+
+It asks no questions and installs PINJ in that folder. It does the following:
+1. Uses the folder it is run from. Started straight from the pen drive, it first copies PINJ to `~/PINJ`.
+2. Installs Python and the packages (internet needed once).
+3. Gives you access to the USB-serial modems.
+4. Opens TCP 8080 in `ufw`.
+5. Points the library at the `library` folder inside PINJ.
+6. Keeps the accounts in `data/pinj_users.sqlite` (**no MySQL needed**).
+7. Installs the **always-on service `pinj`**: it starts at every power-on, before anyone signs in, and restarts
+   5 s after any stop.
+8. Switches off sleep.
+9. Checks that PINJ answers on port 8080.
+
+Run it again after copying a newer PINJ: it keeps `data/`, `logs/` and `library/`. Options: `--mysql` (use MySQL),
+`--keep-sleep`.
+
+**Accounts in Excel, instead of MySQL Workbench:** `PINJ_USERS.xlsx` in the PINJ folder has these sheets:
+- **Users**: role, status, contact, created / approved, last sign-in, failed sign-ins, lock-out, modem agent;
+- **Activity**: the activity record, newest first;
+- **Modem agents**.
+
+PINJ rewrites it within a minute of any change, on Windows too. It is a view only: change accounts in ⚙ → Users
+or with the server commands. Passwords, sessions and agent keys are never written to it.
+
+Day to day, in the PINJ folder, use **`./pinj.sh`**:
+- `status`;
+- `stop` (stays stopped until `start` or the next power-on);
+- `start`, `restart`, `logs`;
+- `monitor` (one panel per user, with commands);
+- `users` (write the Excel file now);
+- `database` (move the accounts into MySQL later, optional).
+
+On Linux, modem ports are named `/dev/ttyUSB0` and so on. Testers still use the Windows PINJ Modem Agent on their
+own PCs.
+
 ## What changed compared with the WSL PINJ
 
 | Area | WSL PINJ | This Windows PINJ |
