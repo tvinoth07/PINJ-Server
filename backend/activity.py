@@ -186,6 +186,7 @@ AUDIT_LABELS = {
     "agent_downloaded": ("⬇ DOWNLOADED AGENT", "d"), "agent_revoked": ("✕ AGENT KEY WITHDRAWN", "y"),
     "library_file": ("📂 LOADED FROM LIBRARY", "b"), "library_changed": ("📂 LIBRARY FOLDERS CHANGED", "y"),
     "myfile_uploaded": ("⬆ UPLOADED MY FILE", "b"), "myfile_removed": ("🗑 REMOVED MY FILE", "y"),
+    "library_download": ("⬇ DOWNLOADED FROM LIBRARY", "b"), "myfile_downloaded": ("⬇ DOWNLOADED MY FILE", "b"),
     "accounts_moved": ("⇄ ACCOUNTS MOVED", "y"),
     "user_unlocked": ("🔓 UNLOCKED", "g"), "user_kicked": ("⏏ SIGNED OUT BY SERVER", "y"),
 }

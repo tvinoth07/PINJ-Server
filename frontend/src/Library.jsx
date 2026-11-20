@@ -110,6 +110,20 @@ function LibraryDialog({ categories, title, onClose, onPick }) {
     }
   };
 
+  // ⬇ — save the file on this PC (the row itself still loads it into the loader)
+  const download = (ev, entry) => {
+    ev.stopPropagation();
+    const path = sub ? sub + "/" + entry.name : entry.name;
+    const a = document.createElement("a");
+    a.href = mine ? `/hub/myfiles/${cat}/file?name=${encodeURIComponent(entry.name)}&download=1`
+                  : `/hub/library/${cat}/file?path=${encodeURIComponent(path)}&download=1`;
+    a.download = entry.name;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    setNote({ tone: "ok", text: `${entry.name} — downloading to this PC (see your browser's downloads).` });
+  };
+
   const crumbs = sub ? sub.split("/") : [];
   const entries = (list?.entries || []).filter(e => !filter || e.name.toLowerCase().includes(filter.toLowerCase()));
 
@@ -198,14 +212,18 @@ function LibraryDialog({ categories, title, onClose, onPick }) {
               <span style={{ color: "var(--text-secondary)", fontSize: 9, flexShrink: 0 }}>{e.modified}</span>
               <span style={{ color: "var(--text-secondary)", fontSize: 9, width: 56, textAlign: "right", flexShrink: 0 }}>
                 {busy === e.name ? "⏳" : e.dir ? "" : fmtSize(e.size)}</span>
+              {!e.dir ? <span role="button" title="Download to this PC" onClick={ev => download(ev, e)}
+                style={{ flexShrink: 0, width: 22, height: 20, display: "inline-flex", alignItems: "center", justifyContent: "center",
+                  borderRadius: 4, border: "1px solid var(--cyan-dim)", color: "var(--cyan)", fontSize: 11 }}>⬇</span>
+                : <span style={{ flexShrink: 0, width: 22 }} />}
               {mine && <span role="button" title="Remove from my files" onClick={ev => remove(ev, e)}
                 style={{ flexShrink: 0, padding: "0 4px", color: "var(--red)", opacity: 0.8 }}>🗑</span>}
             </button>
           ))}
         </div>
         <div style={{ padding: "8px 14px", borderTop: "1px solid var(--border)", background: "var(--bg-raised)", fontSize: 9, color: "var(--text-secondary)" }}>
-          {mine ? "Your files: kept on the PINJ server in your own folder — only you see them. Picking one loads it like dropping it on the loader."
-                : "Files stay on the PINJ server; picking one loads it here exactly like dropping it on the loader."}
+          {mine ? "Your files: kept on the PINJ server in your own folder — only you see them. Picking one loads it like dropping it on the loader; ⬇ saves a copy on this PC."
+                : "Files stay on the PINJ server; picking one loads it here exactly like dropping it on the loader. ⬇ saves a copy on this PC."}
         </div>
       </div>
     </div>

@@ -918,13 +918,15 @@ def library_folder(cat_id: str, request: Request, sub: str = ""):
 
 
 @app.get("/hub/library/{cat_id}/file")
-def library_file(cat_id: str, request: Request, path: str):
+def library_file(cat_id: str, request: Request, path: str, download: bool = False):
+    """Loads a file into a loader, or (download=1, the ⬇ button) saves it on the user's PC."""
     u = require_user(request)
     cat = _library_cat(cat_id)
     p = _library_path(cat, path)
     if not os.path.isfile(p) or os.path.splitext(p)[1].lower() not in cat["exts"]:
         raise HTTPException(404, "No such file.")
-    store.audit(u["username"], "library_file", f"{cat['label']}: {path}"[:500], client_ip(request))
+    store.audit(u["username"], "library_download" if download else "library_file", f"{cat['label']}: {path}"[:500],
+                client_ip(request))
     return FileResponse(p, filename=os.path.basename(p), media_type="application/octet-stream")
 
 
@@ -1016,11 +1018,13 @@ async def myfiles_upload(cat_id: str, request: Request):
 
 
 @app.get("/hub/myfiles/{cat_id}/file")
-def myfiles_get(cat_id: str, name: str, request: Request):
+def myfiles_get(cat_id: str, name: str, request: Request, download: bool = False):
     u = require_user(request)
     p = _my_file(u["username"], cat_id, name)
     if not os.path.isfile(p):
         raise HTTPException(404, "No such file in your files.")
+    if download:
+        store.audit(u["username"], "myfile_downloaded", f"{cat_id}: {os.path.basename(p)}", client_ip(request))
     return FileResponse(p, filename=os.path.basename(p), media_type="application/octet-stream")
 
 
